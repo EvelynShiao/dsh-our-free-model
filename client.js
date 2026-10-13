@@ -1510,6 +1510,7 @@ window.__ModuleLoader__.load({
 .ofm_starbtn:hover::after{left:112%}
 .ofm_starlink{display:inline-flex;align-items:center;gap:6px;text-decoration:none}
 /* ══ 鱼缸（品牌装饰：玻璃缸 + 水位 + 波光 + 鱼群） ════════════════════ */
+.ofm_tank{display:none!important} /* 2026-10-13: 去掉鱼缸装饰与水位动效（数值看下面的可用度文字） */
 .ofm_tank{position:relative;width:206px;height:128px;border-radius:16px;overflow:hidden;flex:none;background:linear-gradient(180deg,rgba(127,166,255,.10),rgba(127,166,255,.03));box-shadow:inset 0 0 0 1px var(--dsw-alias-border-l1)}
 .ofm_tankwater{position:absolute;left:0;right:0;bottom:0;height:var(--lvl,0%);transition:height 1.4s cubic-bezier(.22,.61,.36,1)}
 .ofm_tank.ok .ofm_tankwater{background:linear-gradient(180deg,color-mix(in srgb,var(--dsw-alias-state-business-primary) 72%,transparent),var(--dsw-alias-state-business-primary))}
