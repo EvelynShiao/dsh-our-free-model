@@ -73,19 +73,82 @@ export function mintRequestId(timestamp = Date.now()) {
   return `msg_${hex}${base62From(crypto.randomBytes(14))}`
 }
 
+/** Sessions minted for one conversation, so free-tier quota keeps accumulating
+ *  on one session instead of being spent by a fresh id per request. */
+const CONVERSATION_SESSIONS = new Map()
+/** How long a minted prefix stays usable. The gate accepted a one-day-old
+ *  prefix when it landed (2026-10-13); half a day keeps a 2x margin and still
+ *  mints at most twice a day per conversation. */
+const SESSION_PREFIX_TTL_MS = 12 * 60 * 60 * 1000
+/** Bound the cache: conversations are unbounded, sessions are not worth keeping. */
+const SESSION_CACHE_LIMIT = 256
+
+/**
+ * Read back the timestamp `mintSessionId` folded into the first 12 hex digits.
+ *
+ * The inverse of the `~`/shift that mints it, with one wrinkle: the id carries
+ * only 48 bits, and the minted value is `~(timestamp * 4096 + seq)` which needs
+ * 53, so the low 48 bits are all that survived and the timestamp is only known
+ * modulo 2^36 ms (~2.2 years). The representative nearest `now` is the one that
+ * was meant; every caller here compares against `now` anyway, and no two
+ * plausible readings of one id are ever both in that window.
+ *
+ * @param {string} id - candidate session id
+ * @param {number} [now] - clock used to pick the representative
+ * @returns {number|undefined} epoch ms, undefined when the id is not that shape
+ */
+export function sessionStamp(id, now = Date.now()) {
+  const match = /^ses_([0-9a-f]{12})/.exec(String(id ?? ''))
+  if (match === null) return undefined
+  const raw = Number((0xffffffffffffn ^ BigInt(`0x${match[1]}`)) >> 12n)
+  if (!Number.isSafeInteger(raw) || raw < 0) return undefined
+  const period = 2 ** 36
+  return raw + Math.round((now - raw) / period) * period
+}
+
+/** Whether an id's prefix still decodes to a recent-enough timestamp. */
+function prefixUsable(id, now) {
+  const stamp = sessionStamp(id, now)
+  return stamp !== undefined && now - stamp < SESSION_PREFIX_TTL_MS && stamp - now < 60_000
+}
+
 /**
  * Map one downstream conversation onto one stable upstream session.
  *
  * Free-tier quota is accounted per session, so a fresh id per request exhausts
- * it and surfaces as 429 with growing retry-after. A digest of the harness
- * session id gives the same conversation the same canonical session across
- * restarts, which is how the real client behaves.
+ * it and surfaces as 429 with growing retry-after. For a long while a digest of
+ * the harness session id was enough: same conversation, same canonical session,
+ * across restarts.
+ *
+ * That stopped working on 2026-10-13, when the free lane began refusing any
+ * session whose first 12 hex digits do not decode to a recent timestamp —
+ * `403 FreeTierError: OpenCode's free tier can only be used from within
+ * OpenCode.` A sha256 digest decodes to a timestamp that never existed, so every
+ * free-lane request was refused: chat (adapter.js), the catalog fetch
+ * (core/runtime.js) and the availability probe (probe.js) all share this
+ * function, which is why the picker showed the whole free lane as unavailable
+ * while the models themselves were fine.
+ *
+ * The id therefore carries a real time prefix (`mintSessionId`), cached per
+ * conversation so quota still accumulates on one session, and re-minted only
+ * once the prefix outgrows {@link SESSION_PREFIX_TTL_MS}.
+ *
+ * @param {string} [sessionId] - downstream conversation id (any string)
+ * @param {number} [now] - injectable clock, for tests
+ * @returns {string} gateway-shaped session id
  */
-export function sessionForConversation(sessionId) {
-  if (typeof sessionId === 'string' && SESSION_RE.test(sessionId.trim())) return sessionId.trim()
-  const seed = typeof sessionId === 'string' && sessionId.trim() ? sessionId.trim() : 'global'
-  const digest = crypto.createHash('sha256').update(`our-free-model\0${seed}`).digest()
-  return `ses_${digest.subarray(0, 6).toString('hex')}${base62From(digest.subarray(6, 20))}`
+export function sessionForConversation(sessionId, now = Date.now()) {
+  const trimmed = typeof sessionId === 'string' ? sessionId.trim() : ''
+  if (SESSION_RE.test(trimmed) && prefixUsable(trimmed, now)) return trimmed
+  const seed = trimmed || 'global'
+  const held = CONVERSATION_SESSIONS.get(seed)
+  if (held !== undefined && prefixUsable(held, now)) return held
+  const minted = mintSessionId(now)
+  if (!CONVERSATION_SESSIONS.has(seed) && CONVERSATION_SESSIONS.size >= SESSION_CACHE_LIMIT) {
+    CONVERSATION_SESSIONS.delete(CONVERSATION_SESSIONS.keys().next().value)
+  }
+  CONVERSATION_SESSIONS.set(seed, minted)
+  return minted
 }
 
 /** Stable per-turn request id: retries of the same turn share it. */
