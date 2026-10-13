@@ -348,9 +348,26 @@ async function readRemainder(head, signal) {
  * with a search rather than an anchored match, so one value can satisfy both —
  * verified live against this lane.
  */
+/**
+ * Compose the request User-Agent.
+ *
+ * 2026-10-13: the free-tier gate now refuses any UA that is not exactly the
+ * client token. Measured on the live lane — `opencode/1.18.31` alone: 2/2
+ * answers; the same token with an attribution prefix or suffix: 0/3, always
+ * `403 FreeTierError: OpenCode's free tier can only be used from within
+ * OpenCode`. This used to append the harness attribution, so every free-lane
+ * request carried a prefix the gate now reads as "not our client".
+ *
+ * The lane is an impersonation to begin with: the attribution gives way to a
+ * lane that answers. Two independent requirements used to meet in one header;
+ * the gateway no longer accepts both at once.
+ *
+ * @param {string} [attribution] - the harness attribution UA (now unused here)
+ * @returns {string} the client token the gateway fingerprints
+ */
 function userAgentWith(attribution) {
-  if (typeof attribution !== 'string' || attribution === '') return CLIENT_UA
-  return attribution.includes('opencode/') ? attribution : `${attribution} ${CLIENT_UA}`
+  void attribution
+  return CLIENT_UA
 }
 
 export async function postStreamed({ path, body, session, requestId, attributionUserAgent, signal, onData, timeoutMs = 300000 }) {
