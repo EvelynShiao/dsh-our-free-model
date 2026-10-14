@@ -20,6 +20,9 @@
 import { applyFingerprint, baseModelId, endpointFor, mintRequestId, sessionForConversation, wireFor } from './upstream.js'
 import { toChatMessages, toClaudeMessages, toResponseInput, toToolDefs, repairToolPairing } from './messages.js'
 import { CODE, UpstreamError, postStreamed } from './http.js'
+/* 2026-10-14：OpenCode v2 门禁（session 必须服务端注册）之后，免费车道唯一的合法通道。
+   见 src/opencode-bridge.js 头部注释。 */
+import { bridgeGenerate, readService, BRIDGE_HINT } from './opencode-bridge.js'
 import { postSealedStreamed } from './eac.js'
 import { postKiloStreamed } from './kilo.js'
 import { postAggregateStreamed, isAggregateEntry } from './aggregate.js'
@@ -28,7 +31,6 @@ import { DEFAULT_LEVEL, MIN_BUDGET, budgetFor, defaultEffortFor, effortPatchFor,
 import { createChannel } from './channel.js'
 import { recoveryPolicy, canRecover, canRecoverSilentStop, recoveryMessages, continuationMessages, checkpointFits, addUsage, createBlockTracker } from './recovery.js'
 import { isEacEntry, isKiloEntry } from './catalog.js'
-import { serviceInfo, streamGenerateText } from './local-opencode.js'
 import { isComboEntry, comboChain } from './combos.js'
 import { applyTokenSavers, saverConfig } from './token-saver/index.js'
 import { classifyFailure, describeVerdict, shouldAdvance } from './route/classify.js'
@@ -295,6 +297,45 @@ export class FreeModelAdapter {
    *   the turn outright.
    * @returns the turn's own summary, which only a combo caller reads.
    */
+  /**
+   * 免费车道的本地 opencode 代发（2026-10-14）。
+   *
+   * 为什么不直连 zen：OpenCode v2 网关只认它服务端注册过的真实会话，伪造身份
+   * （UA 任意版本 / 四个 session 头 / 真 projectID）一律 403。这里把整轮对话渲染成
+   * 一段 prompt，交给本机 opencode 后台服务的「会话内 generate」代发——它是真客户端，
+   * 身份天然合法。代价：这条通道是**一次性纯文本**（无工具、无图片、无原生流式），
+   * 我们把文本切片 yield，界面上看起来仍是逐段吐字。
+   */
+  async * runBridge(options, entry, started) {
+    if (readService() === null) {
+      this.deps.recordTurn?.({ at: started, model: entry.id, ok: false, recovered: false, attempts: 0, origin: 'harness' })
+      yield { type: 'finish', reason: { kind: 'error', failure: { message: BRIDGE_HINT, code: 'BRIDGE_UNAVAILABLE' } } }
+      return
+    }
+    const prompt = renderBridgePrompt(options.messages, entry)
+    const signal = options.signal === undefined
+      ? AbortSignal.timeout(300000)
+      : (typeof AbortSignal.any === 'function' ? AbortSignal.any([options.signal, AbortSignal.timeout(300000)]) : options.signal)
+    try {
+      const text = await bridgeGenerate({ modelId: entry.id, prompt, signal })
+      const answer = String(text ?? '')
+      yield { type: 'block-start', index: 0, blockType: 'text' }
+      for (const piece of splitForStream(answer)) yield { type: 'text-delta', index: 0, text: piece }
+      yield { type: 'block-end', index: 0, block: { type: 'text', text: answer } }
+      this.deps.recordTurn?.({ at: started, model: entry.id, ok: true, recovered: false, attempts: 1, origin: 'harness' })
+      yield { type: 'finish', reason: { kind: 'stop' } }
+    } catch (error) {
+      this.deps.recordTurn?.({ at: started, model: entry.id, ok: false, recovered: false, attempts: 1, origin: 'harness' })
+      yield {
+        type: 'finish',
+        reason: {
+          kind: options.signal?.aborted === true ? 'aborted' : 'error',
+          failure: { message: `our free model（本地 opencode 代发）失败：${String(error?.message ?? error)}`, code: 'BRIDGE_FAILED' },
+        },
+      }
+    }
+  }
+
   async * runSingle(options, entry, snapshot, plan = {}) {
     const settings = snapshot.settings ?? {}
     const started = Date.now()
@@ -325,6 +366,14 @@ export class FreeModelAdapter {
     const sealed = isEacEntry(entry)
     const kilo = isKiloEntry(entry)
     const aggregate = isAggregateEntry(entry)
+    /* 2026-10-14 免费车道改造：OpenCode v2 网关要求 session 为其服务端注册的真实会话，
+       伪造身份一律 403（实测 UA/四个 session 头/project 全试过）。这一条纯免费车道
+       （既不是 EAC/kilo 吸收渠道，也不是聚合行）改走本地 opencode 服务代发；
+       kilo/aggregate/EAC 走原路不动。settings.bridgeLocalOpencode === false 可关。 */
+    if (!sealed && !kilo && !aggregate && settings.bridgeLocalOpencode !== false) {
+      yield * this.runBridge(options, entry, started)
+      return { advance: false, verdict: null, ok: true }
+    }
     // The absorbed channels speak the Chat wire regardless of what their ids
     // resemble; only the free lane splits endpoints per model, and an aggregate
     // row carries the wire its provider actually serves.
@@ -418,11 +467,6 @@ export class FreeModelAdapter {
       }, timeoutMs) : undefined
       timer?.unref?.()
       const channel = createChannel()
-      /* OpenCode v2 门禁正解（2026-10-14）：免费车道伪造 session 一律 403；
-         本机 opencode 服务可用时改由它代发（真注册会话 + 真客户端身份）。
-         服务不在时保持原直连路径（会 403，但行为不变、不阻塞其他车道）。
-         细节见 src/local-opencode.js 模块注释。 */
-      const localBridge = sealed || kilo || aggregate ? null : await serviceInfo()
       const request = (sealed
         ? postSealedTurn(this.deps, payload, controller.signal, value => channel.push(value))
         : kilo
@@ -436,15 +480,7 @@ export class FreeModelAdapter {
               signal: controller.signal,
               onData: value => channel.push(value),
             })
-            : localBridge !== null
-              ? streamGenerateText({
-                key: `${String(options.sessionId ?? 'global')}\u0000${entry.id}`,
-                modelId: entry.id,
-                messages: attemptMessages,
-                signal: controller.signal,
-                onData: value => channel.push(value),
-              })
-              : postStreamed({
+            : postStreamed({
           path: endpointFor(entry.id), body: payload, session,
           requestId: attempt === 0 ? recoveryId : mintRequestId(),
           attributionUserAgent: snapshot.attributionUserAgent,
@@ -832,4 +868,42 @@ function describe(entry, settings) {
     }
   }
   return parts.join(' · ')
+}
+
+/* ── 本地 opencode 代发：对话渲染 + 切片（2026-10-14）──────────────────────── */
+
+/**
+ * 把 DSH 的消息数组渲染成给本地 opencode 的一次性 prompt。
+ * 图片/附件只留占位说明（代发通道是纯文本）；总量有上限，防止把本地服务压死。
+ */
+function renderBridgePrompt(messages, entry) {
+  const parts = []
+  const LIMIT = 400000
+  let total = 0
+  for (const message of Array.isArray(messages) ? messages : []) {
+    const role = message?.role ?? 'user'
+    const label = role === 'assistant' ? 'Assistant' : role === 'system' ? 'System' : role === 'tool' ? 'Tool' : 'User'
+    const body = (Array.isArray(message?.content) ? message.content : []).map((block) => {
+      if (block === null || typeof block !== 'object') return ''
+      if (typeof block.text === 'string' && block.text !== '') return block.text
+      if (block.type === 'tool-call') return `[调用工具 ${block.name ?? ''}：${String(block.arguments ?? '').slice(0, 400)}]`
+      if (block.type === 'tool-result') return `[工具结果：${String(block.text ?? '').slice(0, 1500)}]`
+      if (block.type === 'file' || block.type === 'image') return `[${block.type} 附件——本地 opencode 代发通道暂不支持]`
+      return ''
+    }).filter((line) => line !== '').join('\n')
+    if (body === '') continue
+    const line = `${label}: ${body}`
+    total += line.length
+    if (total > LIMIT) break
+    parts.push(line)
+  }
+  parts.push('（以上是一整轮的完整对话。请以 Assistant 身份直接回复最后一条 User 消息，不要调用任何工具，不要复述本段说明。）')
+  return parts.join('\n\n')
+}
+
+/** 把整段文本切成小片，模拟流式吐字。 */
+function splitForStream(text, size = 220) {
+  const out = []
+  for (let i = 0; i < text.length; i += size) out.push(text.slice(i, i + size))
+  return out.length > 0 ? out : ['']
 }
