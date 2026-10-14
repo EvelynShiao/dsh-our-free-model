@@ -28,6 +28,7 @@ import { DEFAULT_LEVEL, MIN_BUDGET, budgetFor, defaultEffortFor, effortPatchFor,
 import { createChannel } from './channel.js'
 import { recoveryPolicy, canRecover, canRecoverSilentStop, recoveryMessages, continuationMessages, checkpointFits, addUsage, createBlockTracker } from './recovery.js'
 import { isEacEntry, isKiloEntry } from './catalog.js'
+import { serviceInfo, streamGenerateText } from './local-opencode.js'
 import { isComboEntry, comboChain } from './combos.js'
 import { applyTokenSavers, saverConfig } from './token-saver/index.js'
 import { classifyFailure, describeVerdict, shouldAdvance } from './route/classify.js'
@@ -417,6 +418,11 @@ export class FreeModelAdapter {
       }, timeoutMs) : undefined
       timer?.unref?.()
       const channel = createChannel()
+      /* OpenCode v2 门禁正解（2026-10-14）：免费车道伪造 session 一律 403；
+         本机 opencode 服务可用时改由它代发（真注册会话 + 真客户端身份）。
+         服务不在时保持原直连路径（会 403，但行为不变、不阻塞其他车道）。
+         细节见 src/local-opencode.js 模块注释。 */
+      const localBridge = sealed || kilo || aggregate ? null : await serviceInfo()
       const request = (sealed
         ? postSealedTurn(this.deps, payload, controller.signal, value => channel.push(value))
         : kilo
@@ -430,7 +436,15 @@ export class FreeModelAdapter {
               signal: controller.signal,
               onData: value => channel.push(value),
             })
-            : postStreamed({
+            : localBridge !== null
+              ? streamGenerateText({
+                key: `${String(options.sessionId ?? 'global')}\u0000${entry.id}`,
+                modelId: entry.id,
+                messages: attemptMessages,
+                signal: controller.signal,
+                onData: value => channel.push(value),
+              })
+              : postStreamed({
           path: endpointFor(entry.id), body: payload, session,
           requestId: attempt === 0 ? recoveryId : mintRequestId(),
           attributionUserAgent: snapshot.attributionUserAgent,

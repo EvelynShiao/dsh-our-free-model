@@ -17,6 +17,7 @@
 import { applyFingerprint, endpointFor, mintRequestId, sessionForConversation, wireFor } from './upstream.js'
 import { CODE, postStreamed } from './http.js'
 import { egressFetch } from './egress.js'
+import { generateText, serviceInfo } from './local-opencode.js'
 
 /** Public-echo sources, tried in order; any one answering is enough. */
 const ECHO_SOURCES = [
@@ -48,6 +49,21 @@ const PING_PROMPT = 'ping'
  */
 export async function probeModel(model, { attributionUserAgent, signal, timeoutMs = 45000 } = {}) {
   const started = Date.now()
+  /* OpenCode v2 门禁：免费车道的可用性探测也走本机 opencode 服务（真会话身份）。
+     否则每个可用模型都会被 403 标成不可用（2026-10-14）。 */
+  try {
+    if ((await serviceInfo()) !== null) {
+      const text = await generateText({
+        key: `probe\u0000${model.id}`,
+        modelId: model.id,
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'ping' }] }],
+        signal,
+      })
+      if (typeof text === 'string') return { state: STATE.available, detail: '', latencyMs: Date.now() - started }
+    }
+  } catch (error) {
+    return { state: STATE.unknown, detail: String(error?.message ?? error).slice(0, 200), latencyMs: Date.now() - started }
+  }
   const session = sessionForConversation('probe:our-free-model')
   const wire = wireFor(model.id)
   const body = buildPing(model.id, wire)

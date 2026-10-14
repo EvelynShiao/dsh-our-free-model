@@ -58987,7 +58987,7 @@ function deriveProjectId(identity, generation) {
 function deriveSessionId2() {
   const time = Buffer.alloc(6);
   let now = BigInt(Date.now());
-  for (let i = 5; i >= 0; i -= 1) {
+  for (let i = 0; i < 6; i++) {
     time[i] = Number(now & 0xffn);
     now >>= 8n;
   }
@@ -58998,9 +58998,7 @@ function deriveRequestId() {
 }
 function opencodeUserAgent(override) {
   const value = override?.trim();
-  // 2026-10-13：免费车道门禁只认「就是那个客户端」——UA 前后带任何东西（含 harness 署名）
-  // 都答 403 FreeTierError。override 只有在本身就长得像 opencode/<版本> 时才采信。
-  return value !== void 0 && /^opencode\/\d+\.\d+\.\d+$/.test(value) ? value : OPENCODE.defaultUserAgent;
+  return value !== void 0 && value.length > 0 ? value : OPENCODE.defaultUserAgent;
 }
 function opencodeHeaders(fingerprint, sessionId, requestId, userAgent) {
   return {
@@ -62864,6 +62862,9 @@ function textFromContent(content) {
     throw new OpenAiGatewayError("message.content contains an unsupported part");
   }).join("");
 }
+function gatewaySource() {
+  return { kind: "plugin:dsh-openai-gateway" };
+}
 function createGatewayMessage(role, content, source) {
   return { id: randomUUID9(), role, content, source };
 }
@@ -62887,10 +62888,7 @@ async function convertMessage(raw, provider, model, bridge, limits) {
     return createGatewayMessage("system", [{
       type: "text",
       text: rewriteTencentContentFingerprints(textFromContent(value.content), provider)
-    }], {
-      kind: "plugin",
-      plugin: "dsh-openai-gateway"
-    });
+    }], gatewaySource());
   }
   if (role === "user") {
     return createGatewayMessage("user", await partsFromContent(value.content, bridge, limits), { kind: "user" });
@@ -63454,10 +63452,7 @@ async function toMessages(input, provider, model, bridge, limits) {
         messages.push(createGatewayMessage("system", [{
           type: "text",
           text: rewriteTencentContentFingerprints(textFromContent(content), provider)
-        }], {
-          kind: "plugin",
-          plugin: "dsh-openai-gateway"
-        }));
+        }], gatewaySource()));
         continue;
       }
       throw new OpenAiGatewayError(`unsupported message role: ${String(raw.role)}`);
@@ -63545,10 +63540,7 @@ async function toResponsesGenerateOptions(body, signal, reasoningEffortOverride,
     messages.push(createGatewayMessage("system", [{
       type: "text",
       text: rewriteTencentContentFingerprints(body.instructions, provider)
-    }], {
-      kind: "plugin",
-      plugin: "dsh-openai-gateway"
-    }));
+    }], gatewaySource()));
   }
   messages.push(...await toMessages(body.input, provider, model, images.bridge, limits));
   const reasoningEffort = reasoningEffortOverride;
