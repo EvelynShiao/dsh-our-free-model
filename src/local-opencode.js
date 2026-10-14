@@ -59,6 +59,19 @@ export async function serviceInfo() {
     }
   }
   if (cached !== null && Date.now() - cachedAt < SERVICE_TTL_MS) return cached
+  /* 手工/跨机口子：$DSH_HOME/our-free-model/opencode-bridge.json = {url, password}
+     —— 手机等没有本地 opencode 服务的设备，把 PC 上局域网暴露的 serve 地址填进来
+     （PC 端：opencode serve --hostname 0.0.0.0 --port <port>，密码见它启动输出），
+     即可复用 PC 的真客户端身份。优先级低于环境变量、高于自动探测。 */
+  const overridePath = join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'our-free-model', 'opencode-bridge.json')
+  try {
+    const obj = JSON.parse(await readFile(overridePath, 'utf8'))
+    if (typeof obj?.url === 'string' && obj.url !== '' && typeof obj?.password === 'string') {
+      cached = { url: obj.url.replace(/\/+$/, ''), password: obj.password, userAgent: obj.userAgent ?? DEFAULT_UA }
+      cachedAt = Date.now()
+      return cached
+    }
+  } catch { /* 没配就自动探测 */ }
   for (const p of statePaths()) {
     try {
       const obj = JSON.parse(await readFile(p, 'utf8'))
