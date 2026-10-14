@@ -152,6 +152,104 @@ export function assertFreeModel(modelId) {
 }
 
 /**
+ * 流式版：建会话 → 订阅 /api/event → 发 prompt → 逐字回调 → 执行结束返回全文。
+ *
+ * 事件形状（v2.0.29 实测）：
+ *   session.text.delta      {sessionID, assistantMessageID, ordinal, delta:"…"}
+ *   session.reasoning.delta {…, delta:"…"}
+ *   session.text.ended      {…, text:"完整文本"}
+ *   session.step.ended      {…, finish, cost, tokens:{input,output,reasoning}}
+ *   session.execution.succeeded / .failed   ← 收尾信号
+ *
+ * @param {{modelId:string, prompt:string, directory?:string, signal?:AbortSignal,
+ *          onDelta?:(delta:string, full:string)=>void,
+ *          onReasoning?:(delta:string, full:string)=>void,
+ *          onUsage?:(tokens:object)=>void}} options
+ * @returns {Promise<string>} 全文
+ */
+export async function bridgeStream({ modelId, prompt, directory, signal, onDelta, onReasoning, onUsage }) {
+  const id = assertFreeModel(modelId)
+  const svc = readService()
+  if (svc === null) throw new Error(BRIDGE_HINT);
+  const dir = directory ?? process.env.DSH_HOME ?? homedir();
+  const session = await createSession(svc, id, dir, signal);
+
+  const ac = new AbortController();
+  const onOuter = () => ac.abort(signal?.reason);
+  if (signal?.aborted === true) onOuter(); else signal?.addEventListener('abort', onOuter, { once: true });
+
+  let full = '';
+  let reasoning = '';
+  let settle;
+  const finished = new Promise((resolve, reject) => { settle = { resolve, reject }; });
+
+  /* 事件订阅（失败即让本次调用失败，绝不静默卡住） */
+  const sub = await fetch(`${svc.url}/api/event`, {
+    headers: { ...headers(svc), Accept: 'text/event-stream' },
+    signal: ac.signal,
+  });
+  if (!sub.ok || sub.body === null) throw new Error(`opencode 事件流打不开 HTTP ${sub.status}`);
+  const reader = sub.body.getReader();
+  const decoder = new TextDecoder();
+  void (async () => {
+    let buf = '';
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done === true) break;
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split('\n');
+        buf = lines.pop() ?? '';
+        for (const line of lines) {
+          if (!line.startsWith('data:')) continue;
+          const payload = line.slice(5).trim();
+          if (payload === '') continue;
+          let event;
+          try { event = JSON.parse(payload); } catch { continue; }
+          const data = event?.data ?? {};
+          if (data.sessionID !== session.id) continue;
+          if (event.type === 'session.text.delta' && typeof data.delta === 'string') {
+            full += data.delta;
+            onDelta?.(data.delta, full);
+          } else if (event.type === 'session.reasoning.delta' && typeof data.delta === 'string') {
+            reasoning += data.delta;
+            onReasoning?.(data.delta, reasoning);
+          } else if (event.type === 'session.step.ended') {
+            if (data.tokens !== undefined) onUsage?.(data.tokens);
+          } else if (event.type === 'session.execution.succeeded') {
+            settle.resolve(full); return;
+          } else if (event.type === 'session.execution.failed' || event.type === 'session.execution.errored') {
+            settle.reject(new Error(String(data?.error?.message ?? 'opencode 会话执行失败'))); return;
+          }
+        }
+      }
+      settle.resolve(full);
+    } catch (error) {
+      settle.reject(error);
+    }
+  })();
+
+  const guard = setTimeout(() => settle.reject(new Error('本地 opencode 会话超过 300 秒未结束')), 300000);
+  try {
+    const res = await fetch(`${svc.url}/api/session/${encodeURIComponent(session.id)}/prompt`, {
+      method: 'POST',
+      headers: headers(svc),
+      body: JSON.stringify({ text: prompt }),
+      signal: ac.signal,
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new Error(`opencode 发消息失败 HTTP ${res.status}: ${text.slice(0, 200)}`);
+    }
+    return await finished;
+  } finally {
+    clearTimeout(guard);
+    ac.abort();
+    signal?.removeEventListener('abort', onOuter);
+  }
+}
+
+/**
  * 一步到位：建会话 → 生成 → 回收会话。
  * 每次请求一个新会话（本地调用，零成本），避免上下文累积/串味。
  * @param {{modelId:string, prompt:string, directory?:string, signal?:AbortSignal}} options

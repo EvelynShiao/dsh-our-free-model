@@ -22,7 +22,7 @@ import { toChatMessages, toClaudeMessages, toResponseInput, toToolDefs, repairTo
 import { CODE, UpstreamError, postStreamed } from './http.js'
 /* 2026-10-14：OpenCode v2 门禁（session 必须服务端注册）之后，免费车道唯一的合法通道。
    见 src/opencode-bridge.js 头部注释。 */
-import { bridgeGenerate, readService, BRIDGE_HINT } from './opencode-bridge.js'
+import { bridgeStream, readService, BRIDGE_HINT } from './opencode-bridge.js'
 import { postSealedStreamed } from './eac.js'
 import { postKiloStreamed } from './kilo.js'
 import { postAggregateStreamed, isAggregateEntry } from './aggregate.js'
@@ -316,24 +316,71 @@ export class FreeModelAdapter {
     const signal = options.signal === undefined
       ? AbortSignal.timeout(300000)
       : (typeof AbortSignal.any === 'function' ? AbortSignal.any([options.signal, AbortSignal.timeout(300000)]) : options.signal)
-    try {
-      const text = await bridgeGenerate({ modelId: entry.id, prompt, signal })
-      const answer = String(text ?? '')
-      yield { type: 'block-start', index: 0, blockType: 'text' }
-      for (const piece of splitForStream(answer)) yield { type: 'text-delta', index: 0, text: piece }
-      yield { type: 'block-end', index: 0, block: { type: 'text', text: answer } }
-      this.deps.recordTurn?.({ at: started, model: entry.id, ok: true, recovered: false, attempts: 1, origin: 'harness' })
-      yield { type: 'finish', reason: { kind: 'stop' } }
-    } catch (error) {
+
+    /* 事件 → 队列 → generator：先到的先吐（首字通常 1~3 秒） */
+    const queue = []
+    let wake = null
+    let failure = null
+    let ended = false
+    const nudge = () => { if (wake !== null) { const fn = wake; wake = null; fn() } }
+    const push = (item) => { queue.push(item); nudge() }
+    const run = bridgeStream({
+      modelId: entry.id,
+      prompt,
+      signal,
+      onDelta: (delta) => push({ kind: 'text', delta }),
+      onReasoning: (delta) => push({ kind: 'reasoning', delta }),
+    })
+    run.then(() => { ended = true; push(null) }, (error) => { failure = error; ended = true; push(null) })
+
+    let current = null
+    let index = 0
+    let sawText = false
+    const closeCurrent = function* () {
+      if (current !== null && current.block.text !== '') {
+        yield { type: 'block-end', index: current.index, block: current.block }
+      }
+      current = null
+    }
+
+    while (true) {
+      if (queue.length === 0) {
+        if (ended) break
+        await new Promise((resolve) => { wake = resolve })
+        continue
+      }
+      const item = queue.shift()
+      if (item === null) break
+      if (current === null || current.kind !== item.kind) {
+        yield * closeCurrent()
+        const kind = item.kind
+        current = { kind, index: index++, block: kind === 'reasoning' ? { type: 'reasoning', text: '' } : { type: 'text', text: '' } }
+        yield { type: 'block-start', index: current.index, blockType: kind }
+      }
+      current.block.text += item.delta
+      if (item.kind === 'text') sawText = true
+      yield { type: item.kind === 'text' ? 'text-delta' : 'reasoning-delta', index: current.index, text: item.delta }
+    }
+    yield * closeCurrent()
+    try { await run; failure = null } catch (error) { failure = error }
+
+    if (failure !== null && !sawText) {
       this.deps.recordTurn?.({ at: started, model: entry.id, ok: false, recovered: false, attempts: 1, origin: 'harness' })
       yield {
         type: 'finish',
         reason: {
           kind: options.signal?.aborted === true ? 'aborted' : 'error',
-          failure: { message: `our free model（本地 opencode 代发）失败：${String(error?.message ?? error)}`, code: 'BRIDGE_FAILED' },
+          failure: { message: `our free model（本地 opencode 代发）失败：${String(failure?.message ?? failure)}`, code: 'BRIDGE_FAILED' },
         },
       }
+      return
     }
+    this.deps.recordTurn?.({ at: started, model: entry.id, ok: failure === null, recovered: false, attempts: 1, origin: 'harness' })
+    if (failure !== null) {
+      yield { type: 'finish', reason: { kind: 'error', failure: { message: `本地 opencode 代发中途失败：${String(failure?.message ?? failure)}`, code: 'STREAM_CUT' } } }
+      return
+    }
+    yield { type: 'finish', reason: { kind: 'stop' } }
   }
 
   async * runSingle(options, entry, snapshot, plan = {}) {
