@@ -135,6 +135,22 @@ export async function generateInSession(svc, sessionId, modelId, prompt, signal)
   return out;
 }
 
+/** 免费档模型 id 的形状：zen 的免费车道全部带 `-free` 后缀。 */
+export const FREE_MODEL_RE = /-free$/i;
+
+/**
+ * 硬闸：这条桥**只准放行免费档模型**。
+ *
+ * 走的是用户本机 opencode（匿名、无账号），但万一哪天插件把付费档 id 送进来，
+ * 那就会真的产生账单。宁可直接拒绝，也不给"意外花钱"留口子。
+ */
+export function assertFreeModel(modelId) {
+  if (typeof modelId !== 'string' || !FREE_MODEL_RE.test(modelId.trim())) {
+    throw new Error(`本地 opencode 代发通道只服务免费档模型（id 需以 -free 结尾），拒绝：${String(modelId)}`);
+  }
+  return modelId.trim();
+}
+
 /**
  * 一步到位：建会话 → 生成 → 回收会话。
  * 每次请求一个新会话（本地调用，零成本），避免上下文累积/串味。
@@ -142,9 +158,10 @@ export async function generateInSession(svc, sessionId, modelId, prompt, signal)
  * @returns {Promise<string>} 模型输出文本
  */
 export async function bridgeGenerate({ modelId, prompt, directory, signal }) {
+  const id = assertFreeModel(modelId);
   const svc = readService();
   if (svc === null) throw new Error(BRIDGE_HINT);
   const dir = directory ?? process.env.DSH_HOME ?? homedir();
-  const session = await createSession(svc, modelId, dir, signal);
-  return generateInSession(svc, session.id, modelId, prompt, signal);
+  const session = await createSession(svc, id, dir, signal);
+  return generateInSession(svc, session.id, id, prompt, signal);
 }
