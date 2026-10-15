@@ -133,7 +133,13 @@ export class FreeModelAdapter {
         defaultMaxTokens: 8192,
       }
     }
-    const ceiling = Math.min(entry.maxOutput, state.settings.defaultMaxTokens ?? 32768)
+    // 以模型自身输出上限为准（2026-10-15）。设置里的 defaultMaxTokens 只在
+    // 被显式设成正数时才收缩（0 / 缺省 = 跟随模型）；旧代码无条件 min 会把能写
+    // 131072 的模型压到 32768。
+    const configuredCeiling = Number(state.settings.defaultMaxTokens) || 0
+    const ceiling = configuredCeiling > 0
+      ? Math.min(entry.maxOutput, configuredCeiling)
+      : entry.maxOutput
     const efforts = effortsFor(entry, undefined, state.settings.defaultMaxTokens)
     return {
       provider,

@@ -1634,7 +1634,14 @@ function sanitizeSettings(patch, current) {
   }
   positive('probeIntervalMinutes', 15)
   positive('feedPollMinutes', 30)
-  positive('defaultMaxTokens', 32768)
+  // 0 是有效答案：跟随模型自身输出上限（2026-10-15）。与 updateCheckHours 同理，
+  // 不能把 0 当成「用户没填」而回落到一个固定上限。
+  if (next.defaultMaxTokens !== undefined) {
+    const value = Number(next.defaultMaxTokens)
+    next.defaultMaxTokens = Number.isFinite(value) && value >= 0
+      ? Math.trunc(value)
+      : (Number(current.defaultMaxTokens) || 0)
+  }
   if (next.updateCheckHours !== undefined) {
     // Zero is a real answer here: it means "stop checking for updates".
     const hours = Number(next.updateCheckHours)
@@ -2227,12 +2234,22 @@ function clientSnippets({ forward, key, lanKey, models }) {
   }
 }
 
+/**
+ * 档位预算，仅在三档真的不同时才返回（否则省略，界面不显示「档位」标签）。
+ * 2026-10-15 起额度以模型自身输出上限为准，阶梯通常已同值。
+ */
+function rungBudgets(entry, defaultMaxTokens) {
+  const ladder = budgetLadder(entry, undefined, defaultMaxTokens)
+  const distinct = new Set(ladder.map(row => row.tokens))
+  return distinct.size > 1 ? { budgets: ladder } : {}
+}
+
 function publicSettings(settings, forwardInfo, egressInfo) {
   return {
     enabled: settings.enabled !== false,
     exposeRegionModels: settings.exposeRegionModels !== false,
     probeIntervalMinutes: settings.probeIntervalMinutes ?? 15,
-    defaultMaxTokens: settings.defaultMaxTokens ?? 32768,
+    defaultMaxTokens: settings.defaultMaxTokens ?? 0,
     announcementAck: settings.announcementAck ?? '',
     feedUrl: typeof settings.feedUrl === 'string' ? settings.feedUrl : '',
     feedPollMinutes: settings.feedPollMinutes ?? 30,
@@ -2313,7 +2330,9 @@ function buildSummary(deps) {
       // What each rung of the effort menu will really put on the wire for this
       // model, so the page never shows a 32K "output ceiling" beside a call that
       // was cut off at 8K. A model with no effort menu has no ladder to show.
-      ...(entry.reasoning === true ? { budgets: budgetLadder(entry, undefined, defaultMaxTokens) } : {}),
+      // 档位阶梯只在真的分档时才展示（2026-10-15 起额度以模型上限为准，
+      // 三档同值，再显示「档位」是噪音）。
+      ...(entry.reasoning === true ? rungBudgets(entry, defaultMaxTokens) : {}),
       // `null` here is what the picker does not advertise; the roster still lists
       // those models, because "the probe refused it" is the user's only evidence.
       route: (state.membership[ROUTE_MAIN] ?? []).includes(entry.id) ? ROUTE_MAIN

@@ -177,8 +177,9 @@ export const SETTINGS_INITIAL = {
   chanGateway: {
     relay: { enabled: false, host: '127.0.0.1', port: 18326, key: '' },
   },
-  /** Cap a turn's output so a slow lane cannot run away. */
-  defaultMaxTokens: 32768,
+  /** 单次输出上限。0 = 跟随模型自身上限（默认，2026-10-15 起）。
+   *  旧的 32768 会把能写 131072 的模型压到 32768。 */
+  defaultMaxTokens: 0,
   /** 所有模型默认允许一次纯推理检查点续写，false 可关闭。 */
   streamRecovery: true,
   /** Token savers. Tool-output compaction is on by default — it is invisible to

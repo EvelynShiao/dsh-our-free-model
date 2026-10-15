@@ -41,6 +41,9 @@ export const DEFAULT_LEVEL = 'balanced'
 /** Rungs of a model that must think are widened by this factor; see the module note. */
 export const ALWAYS_THINKING_FACTOR = 2
 
+/** 模型元数据缺 maxOutput 时的兜底上限。正常路径不会走到这里。 */
+export const DEFAULT_MODEL_MAX_OUTPUT = 32768
+
 /** Does this model expose an effort menu at all? */
 export function supportsEffort(model) {
   return model?.reasoning === true
@@ -75,18 +78,15 @@ export function resolveLevel(level, model) {
     ?? LEVELS.find(candidate => candidate.id === DEFAULT_LEVEL)
 }
 
-/** The ceiling one rung carries on one model, before capacity is applied. */
-function ceilingOf(entry, model) {
-  if (entry === undefined || entry.ceiling === undefined) return undefined
-  return model?.canDisableThinking === false ? entry.ceiling * ALWAYS_THINKING_FACTOR : entry.ceiling
-}
 
 /**
  * Resolve the generation ceiling for one level against one model.
  *
- * The level ceiling is the controlling term; the model's own capacity and the
- * session's request can only lower it further, never raise it. A level with no
- * ceiling inherits the model capacity, which is why "Deep" is the top row.
+ * The model's own capacity is the controlling term (2026-10-15 定案).
+ * Neither the session's request nor the plugin default may lower it: an
+ * explicit ceiling on either side silently truncated answers the model could
+ * have finished — a compaction call carrying the preset's 4096 was cut off on a
+ * model that writes 131072, because thinking and the summary share the ceiling.
  *
  * @param {string|undefined} level - the effort id the harness selected
  * @param {object} model - catalog entry, supplying `maxOutput`
@@ -99,20 +99,20 @@ export function budgetFor(level, model, requested, fallback) {
   // settings page's own cleared input — `Number('') || 0` — reached the wire as
   // `min(model capacity, 0)`, and every turn of every model silently came back
   // clamped to `MIN_BUDGET`.
-  const capacity = Math.min(
-    model?.maxOutput ?? 32768,
-    usableTokens(requested),
-    usableTokens(fallback),
-  )
+  // 只有模型自己的上限说了算：旧实现是
+  //   min(模型上限, 会话请求值, 插件默认值)
+  // 后两项会把模型本可输出的空间砍掉。取消后 min 自然退化成模型自己的上限。
+  const capacity = Number.isFinite(model?.maxOutput) && model.maxOutput > 0
+    ? model.maxOutput
+    : DEFAULT_MODEL_MAX_OUTPUT
   // A model with a declared thinking menu has its level as the real control on
   // the wire (an effort field the gateway forwards), so its ceiling is the
   // model capacity regardless of level — a ladder here would cut answers for a
   // menu that never promised to. Both absorbed channels declare menus; the
   // free lane's own ladder is the budget semantics below.
-  if (hasDeclaredEffortMenu(model)) return Math.max(MIN_BUDGET, Math.trunc(capacity))
-  const ceiling = ceilingOf(resolveLevel(level, model), model)
-  if (ceiling === undefined) return Math.max(MIN_BUDGET, Math.trunc(capacity))
-  return Math.max(MIN_BUDGET, Math.trunc(Math.min(ceiling, capacity)))
+  // 档位（精简/均衡/深思）不再收缩额度：那是又一个上限，而这里的规则是
+  // 「以模型限制为准」。档位对已声明思考菜单的模型照旧走 effortPatchFor 上线路。
+  return Math.max(MIN_BUDGET, Math.trunc(capacity))
 }
 
 /** A caller-supplied token ceiling, or "none" when it is not a positive number. */
