@@ -28,12 +28,18 @@
  */
 
 import fs from 'node:fs';
+import net from 'node:net';
+import { spawn } from 'node:child_process';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 
 /** 给用户看的失败提示（插件界面/错误里引用）。 */
 export const BRIDGE_HINT =
-  '需要本机 opencode v2 后台服务：npm i -g @opencode/cli && opencode service start（免费车道走它代发）';
+  '需要本机 opencode v2 后台服务：npm i -g @opencode/cli（装好后会按需自动拉起，首次用免费模型多等约 0.5 秒；也可手动 opencode service start）';
+
+/** 服务没跑时的探针说明——按需启动模式下这是正常状态，不是故障。 */
+export const BRIDGE_IDLE_HINT =
+  '本机 opencode 服务未启动（按需启动：第一次用免费模型时自动拉起，约 0.5 秒）';
 
 const UA_FALLBACK = 'opencode/latest/2.0.29/cli';
 
@@ -70,6 +76,103 @@ export function readService() {
     } catch { /* 换下一个候选 */ }
   }
   return null;
+}
+
+/* ------------------------------------------------------------------ *
+ * 按需启动（2026-10-15）
+ *
+ * 常驻的 opencode 后台服务要占 145~250 MB 内存，而它自己又没有开机自启，
+ * 机器一重启免费车道就整体失效。于是改成：平时不跑，谁要用免费车道就把
+ * 它拉起来（真机实测 start → 端口可用约 0.4 秒），代价只是那一轮慢半秒。
+ *
+ * 探针走 autostart:false，只查不启——否则 15 分钟一轮的自动探测会把服务
+ * 变回常驻，"按需"就白做了。
+ *
+ * 注意：DSH 沙箱下 child_process 必须 stdio:'ignore'（走管道会被 EPERM 拒），
+ * 而且要 detached + unref，否则服务会跟着父进程一起退出。
+ * ------------------------------------------------------------------ */
+
+const START_TIMEOUT_MS = 10_000;
+
+/** 找 opencode 可执行文件；都找不到就退回 PATH 里的 `opencode`。 */
+function opencodeCli() {
+  const home = homedir();
+  const candidates = [
+    process.env.APPDATA === undefined ? '' : join(process.env.APPDATA, 'npm', 'node_modules', '@opencode', 'cli', 'bin', 'opencode.exe'),
+    join(home, 'AppData', 'Roaming', 'npm', 'node_modules', '@opencode', 'cli', 'bin', 'opencode.exe'),
+    join(home, '.local', 'bin', 'opencode'),
+    '/usr/local/bin/opencode',
+    '/usr/bin/opencode',
+    '/opt/homebrew/bin/opencode',
+  ].filter(candidate => candidate !== '');
+  for (const candidate of candidates) {
+    try { if (fs.statSync(candidate).isFile()) return { file: candidate, viaShell: false }; } catch { /* 试下一个 */ }
+  }
+  return { file: 'opencode', viaShell: true };
+}
+
+/** 本机装没装 opencode 客户端——决定「能不能按需拉起」。 */
+export function hasOpencodeCli() {
+  const cli = opencodeCli();
+  if (cli.viaShell === false) return true;
+  const separator = process.platform === 'win32' ? ';' : ':';
+  const names = process.platform === 'win32' ? ['opencode.exe', 'opencode.cmd', 'opencode.bat'] : ['opencode'];
+  for (const dir of String(process.env.PATH ?? '').split(separator)) {
+    if (dir === '') continue;
+    for (const name of names) {
+      try { if (fs.statSync(join(dir, name)).isFile()) return true; } catch { /* 继续找 */ }
+    }
+  }
+  return false;
+}
+
+/** 端口通不通——判断服务是否真活着，而不是只看 service.json 还在不在。 */
+function portOpen(url, timeoutMs = 700) {
+  return new Promise(resolve => {
+    let parsed;
+    try { parsed = new URL(url); } catch { resolve(false); return }
+    const socket = net.connect({ host: parsed.hostname, port: Number(parsed.port) });
+    const settle = value => { socket.destroy(); resolve(value) };
+    socket.setTimeout(timeoutMs);
+    socket.once('connect', () => settle(true));
+    socket.once('timeout', () => settle(false));
+    socket.once('error', () => settle(false));
+  });
+}
+
+let pendingStart = null;
+
+/**
+ * 拿一个**确实活着**的服务连接；不在跑就按需拉起来（幂等，并发只起一次）。
+ * @param {{autostart?:boolean}} options autostart:false = 只查不启动（探针用）
+ * @returns {Promise<{url:string,password:string}|null>}
+ */
+export async function ensureService({ autostart = true } = {}) {
+  const current = readService();
+  if (current !== null && await portOpen(current.url)) return current;
+  if (autostart !== true) return null;
+  if (!hasOpencodeCli()) return null;
+  if (pendingStart !== null) return pendingStart;
+  pendingStart = (async () => {
+    const cli = opencodeCli();
+    try {
+      const child = spawn(cli.file, ['service', 'start'], {
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true,
+        shell: cli.viaShell,
+      });
+      child.unref();
+    } catch { /* 起不来就走下面的超时分支 */ }
+    const deadline = Date.now() + START_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 150));
+      const svc = readService();
+      if (svc !== null && await portOpen(svc.url)) return svc;
+    }
+    return null;
+  })().finally(() => { pendingStart = null });
+  return pendingStart;
 }
 
 /** 服务是否可用（不抛错，供设置页/探针显示）。 */
@@ -167,9 +270,9 @@ export function assertFreeModel(modelId) {
  *          onUsage?:(tokens:object)=>void}} options
  * @returns {Promise<string>} 全文
  */
-export async function bridgeStream({ modelId, prompt, directory, signal, onDelta, onReasoning, onUsage }) {
+export async function bridgeStream({ modelId, prompt, directory, signal, onDelta, onReasoning, onUsage, autostart = true }) {
   const id = assertFreeModel(modelId)
-  const svc = readService()
+  const svc = await ensureService({ autostart })
   if (svc === null) throw new Error(BRIDGE_HINT);
   const dir = directory ?? process.env.DSH_HOME ?? homedir();
   const session = await createSession(svc, id, dir, signal);
@@ -255,9 +358,9 @@ export async function bridgeStream({ modelId, prompt, directory, signal, onDelta
  * @param {{modelId:string, prompt:string, directory?:string, signal?:AbortSignal}} options
  * @returns {Promise<string>} 模型输出文本
  */
-export async function bridgeGenerate({ modelId, prompt, directory, signal }) {
+export async function bridgeGenerate({ modelId, prompt, directory, signal, autostart = true }) {
   const id = assertFreeModel(modelId);
-  const svc = readService();
+  const svc = await ensureService({ autostart });
   if (svc === null) throw new Error(BRIDGE_HINT);
   const dir = directory ?? process.env.DSH_HOME ?? homedir();
   const session = await createSession(svc, id, dir, signal);

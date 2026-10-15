@@ -22,7 +22,7 @@ import { toChatMessages, toClaudeMessages, toResponseInput, toToolDefs, repairTo
 import { CODE, UpstreamError, postStreamed } from './http.js'
 /* 2026-10-14：OpenCode v2 门禁（session 必须服务端注册）之后，免费车道唯一的合法通道。
    见 src/opencode-bridge.js 头部注释。 */
-import { bridgeStream, readService, BRIDGE_HINT } from './opencode-bridge.js'
+import { bridgeStream, readService, hasOpencodeCli, BRIDGE_HINT } from './opencode-bridge.js'
 import { postSealedStreamed } from './eac.js'
 import { postKiloStreamed } from './kilo.js'
 import { postAggregateStreamed, isAggregateEntry } from './aggregate.js'
@@ -307,7 +307,10 @@ export class FreeModelAdapter {
    * 我们把文本切片 yield，界面上看起来仍是逐段吐字。
    */
   async * runBridge(options, entry, started) {
-    if (readService() === null) {
+    /* 2026-10-15：服务改成「按需启动」——平时不跑，省下 145~250 MB。
+       service.json 不在是正常状态（服务停掉时它会被删），只要本机装了
+       opencode 客户端就继续走 bridgeStream，由它把服务拉起来。 */
+    if (readService() === null && !hasOpencodeCli()) {
       this.deps.recordTurn?.({ at: started, model: entry.id, ok: false, recovered: false, attempts: 0, origin: 'harness' })
       yield { type: 'finish', reason: { kind: 'error', failure: { message: BRIDGE_HINT, code: 'BRIDGE_UNAVAILABLE' } } }
       return

@@ -18,7 +18,7 @@ import { applyFingerprint, endpointFor, mintRequestId, sessionForConversation, w
 import { CODE, postStreamed } from './http.js'
 import { egressFetch } from './egress.js'
 /* 2026-10-14：免费车道改走本地 opencode 服务代发（OpenCode v2 门禁后唯一合法通道）。 */
-import { bridgeGenerate, readService } from './opencode-bridge.js'
+import { bridgeGenerate, readService, hasOpencodeCli, BRIDGE_IDLE_HINT } from './opencode-bridge.js'
 
 /** Public-echo sources, tried in order; any one answering is enough. */
 const ECHO_SOURCES = [
@@ -51,10 +51,17 @@ const PING_PROMPT = 'ping'
 export async function probeModel(model, { attributionUserAgent, signal, timeoutMs = 45000 } = {}) {
   const started = Date.now()
   /* 2026-10-14：免费车道已被 OpenCode v2 门禁（伪造 session 一律 403），改走本地
-     opencode 服务代发；探针必须走同一条道，否则界面上所有免费模型都会显示不可用。 */
+     opencode 服务代发；探针必须走同一条道，否则界面上所有免费模型都会显示不可用。
+     2026-10-15：服务改成按需启动，探针**只查不启**（autostart:false）——否则 15 分钟
+     一轮的自动探测会把服务变回常驻，"平时不占内存"就白做了。服务没跑时报 unknown
+     （模型仍留在列表里：computeMembership 只排除 unavailable），详情写明首次使用会
+     自动拉起。 */
+  if (readService() === null && hasOpencodeCli()) {
+    return { state: STATE.unknown, detail: BRIDGE_IDLE_HINT, latencyMs: Date.now() - started }
+  }
   if (readService() !== null) {
     try {
-      await bridgeGenerate({ modelId: model.id, prompt: 'ping', signal })
+      await bridgeGenerate({ modelId: model.id, prompt: 'ping', signal, autostart: false })
       return { state: STATE.available, latencyMs: Date.now() - started }
     } catch (error) {
       return {
