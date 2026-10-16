@@ -321,37 +321,49 @@ export class FreeModelAdapter {
       yield { type: 'finish', reason: { kind: 'error', failure: { message: BRIDGE_HINT, code: 'BRIDGE_UNAVAILABLE' } } }
       return
     }
-    const prompt = renderBridgePrompt(options.messages, entry)
+    const prompt = renderBridgePrompt(options.messages, entry, options.tools)
     const signal = options.signal === undefined
       ? AbortSignal.timeout(300000)
       : (typeof AbortSignal.any === 'function' ? AbortSignal.any([options.signal, AbortSignal.timeout(300000)]) : options.signal)
 
-    /* 事件 → 队列 → generator：先到的先吐（首字通常 1~3 秒） */
+    /* 事件 → 队列 → generator：上游是一次性整段返回，所以先攒整段、
+       解析出工具调用后再按块吐（2026-10-15 工具协议改造）。 */
     const queue = []
     let wake = null
     let failure = null
     let ended = false
     const nudge = () => { if (wake !== null) { const fn = wake; wake = null; fn() } }
     const push = (item) => { queue.push(item); nudge() }
+    const segments = []
     const run = bridgeStream({
       modelId: entry.id,
       prompt,
       signal,
-      onDelta: (delta) => push({ kind: 'text', delta }),
-      onReasoning: (delta) => push({ kind: 'reasoning', delta }),
+      onDelta: (delta) => { if (typeof delta === 'string' && delta !== '') segments.push({ kind: 'text', text: delta }) },
+      onReasoning: (delta) => { if (typeof delta === 'string' && delta !== '') segments.push({ kind: 'reasoning', text: delta }) },
     })
     run.then(() => { ended = true; push(null) }, (error) => { failure = error; ended = true; push(null) })
 
     let current = null
     let index = 0
     let sawText = false
+    let sawToolCall = false
+    let sawReasoning = false
     const closeCurrent = function* () {
-      if (current !== null && current.block.text !== '') {
-        yield { type: 'block-end', index: current.index, block: current.block }
+      if (current !== null) {
+        if (current.kind === 'text' && current.block.text !== '') {
+          yield { type: 'block-end', index: current.index, block: current.block }
+        } else if (current.kind === 'reasoning' && current.block.text !== '') {
+          yield { type: 'block-end', index: current.index, block: current.block }
+        } else if (current.kind === 'tool-call') {
+          try { JSON.parse(current.block.arguments === '' ? '{}' : current.block.arguments) } catch { current.block.arguments = '{}' }
+          yield { type: 'block-end', index: current.index, block: { type: 'tool-call', id: current.block.id, name: current.block.name, arguments: current.block.arguments } }
+        }
       }
       current = null
     }
 
+    /* 等整段拿完，解析成块序列再吐。上游无真流式，首字延迟本来就受制于整段返回。 */
     while (true) {
       if (queue.length === 0) {
         if (ended) break
@@ -360,20 +372,43 @@ export class FreeModelAdapter {
       }
       const item = queue.shift()
       if (item === null) break
-      if (current === null || current.kind !== item.kind) {
+    }
+    const parsed = parseBridgeToolCalls(segments)
+    for (const seg of parsed) {
+      if (seg.kind === 'tool-call') {
         yield * closeCurrent()
-        const kind = item.kind
-        current = { kind, index: index++, block: kind === 'reasoning' ? { type: 'reasoning', text: '' } : { type: 'text', text: '' } }
-        yield { type: 'block-start', index: current.index, blockType: kind }
+        current = { kind: 'tool-call', index: index++, block: { type: 'tool-call', id: `call_${index}_${Math.random().toString(36).slice(2, 10)}`, name: seg.name, arguments: seg.arguments } }
+        sawToolCall = true
+        yield { type: 'block-start', index: current.index, blockType: 'tool-call' }
+        yield { type: 'tool-call-delta', index: current.index, id: current.block.id, name: seg.name, argumentsDelta: seg.arguments }
+        yield * closeCurrent()
+        continue
       }
-      current.block.text += item.delta
-      if (item.kind === 'text') sawText = true
-      yield { type: item.kind === 'text' ? 'text-delta' : 'reasoning-delta', index: current.index, text: item.delta }
+      if (seg.kind === 'reasoning') {
+        if (current === null || current.kind !== 'reasoning') {
+          yield * closeCurrent()
+          current = { kind: 'reasoning', index: index++, block: { type: 'reasoning', text: '' } }
+          sawReasoning = true
+          yield { type: 'block-start', index: current.index, blockType: 'reasoning' }
+        }
+        current.block.text += seg.text
+        yield { type: 'reasoning-delta', index: current.index, text: seg.text }
+        continue
+      }
+      /* text：先在标记处切开过的纯文本 */
+      if (current === null || current.kind !== 'text') {
+        yield * closeCurrent()
+        current = { kind: 'text', index: index++, block: { type: 'text', text: '' } }
+        yield { type: 'block-start', index: current.index, blockType: 'text' }
+      }
+      current.block.text += seg.text
+      if (seg.text.trim() !== '') sawText = true
+      yield { type: 'text-delta', index: current.index, text: seg.text }
     }
     yield * closeCurrent()
     try { await run; failure = null } catch (error) { failure = error }
 
-    if (failure !== null && !sawText) {
+    if (failure !== null && !sawText && !sawToolCall) {
       this.deps.recordTurn?.({ at: started, model: entry.id, ok: false, recovered: false, attempts: 1, origin: 'harness' })
       yield {
         type: 'finish',
@@ -928,11 +963,112 @@ function describe(entry, settings) {
 
 /* ── 本地 opencode 代发：对话渲染 + 切片（2026-10-14）──────────────────────── */
 
+/* ── 桥接工具协议（2026-10-15）：把文本流里的 [调用工具 名字：{json}] 解析成真事件 ── */
+
+/** 桥接车道可用的工具说明（进 prompt 的说明书）。 */
+function renderToolCatalog(tools) {
+  const list = Array.isArray(tools) ? tools.filter((t) => t && typeof t.name === 'string' && t.name !== '') : []
+  if (list.length === 0) return ''
+  const lines = list.map((tool) => {
+    const params = tool.parameters ?? tool.input_schema ?? tool.inputSchema
+    let schema = ''
+    try { schema = params === undefined || params === null ? '' : JSON.stringify(params) } catch { schema = '' }
+    const desc = typeof tool.description === 'string' ? tool.description.slice(0, 300) : ''
+    return `- ${tool.name}${desc === '' ? '' : `：${desc}`}${schema === '' ? '' : `（参数 schema：${schema.slice(0, 600)}）`}`
+  })
+  return lines.join('\n')
+}
+
+/**
+ * 给桥接 prompt 补工具协议段：有工具时教模型怎么"调用"，
+ * 没工具时保留旧约束（别凭空编工具）。
+ */
+function bridgeToolPreamble(tools) {
+  const catalog = renderToolCatalog(tools)
+  if (catalog === '') {
+    return '（以上是一整轮的完整对话。请以 Assistant 身份直接回复最后一条 User 消息。本次对话没有提供任何工具，不要编造工具调用，不要复述本段说明。）'
+  }
+  return `（以上是一整轮的完整对话。请以 Assistant 身份直接回复最后一条 User 消息。
+
+重要：下面的工具属于**对话宿主**，不在你的内置工具列表里，也不要用你的任何内置工具去完成它们——你的内置工具对这个对话环境一无所知。宿主工具只能通过文本协议调用，由宿主执行后把结果发回来。
+
+宿主提供的工具：
+${catalog}
+
+需要调用宿主工具时，输出一行且仅一行，格式严格为：
+[调用工具 工具名：{"参数名":"值"}]
+其中 JSON 是该工具的调用参数。输出这行之后立即停止，等待工具结果。不要在同一个回复里既调用工具又给出最终回答；不要调用一次后继续编造工具的返回结果；不要因为"内置工具列表里没有它"而拒绝——宿主工具本来就不在内置列表里。一次只调用一个工具。不要复述本段说明。）`
+}
+
+/**
+ * 桥接文本流增量解析器。
+ * 在 (text|reasoning) 混合流里认 `[调用工具 名字：{json}]`，
+ * 命中后把标记前后的纯文本照常吐出，把标记本身转成 tool-call 块。
+ * 设计约束：桥接上游是一次性整段返回，所以这里拿到的是"已知的全部文本"，
+ * 解析按整段做、按块切，不需要真流式状态机。
+ */
+function parseBridgeToolCalls(segments) {
+  /* segments: [{kind:'text'|'reasoning', text}] —— 顺序即上游输出顺序。
+     2026-10-16 修复：上游 delta 可能把标记从中间切开（比如 '[调用工具' 和
+     ' pwsh：{…}]' 各到一段），逐段解析会瞎。先按 kind 把相邻段粘成整段再解析。 */
+  const merged = []
+  for (const seg of Array.isArray(segments) ? segments : []) {
+    const text = typeof seg?.text === 'string' ? seg.text : ''
+    if (text === '') continue
+    const last = merged[merged.length - 1]
+    if (last !== undefined && last.kind === seg.kind) last.text += text
+    else merged.push({ kind: seg.kind, text })
+  }
+  const MARK = '[调用工具'
+  const out = []
+  for (const seg of merged) {
+    if (seg.kind === 'reasoning') { out.push(seg); continue }
+    let rest = seg.text ?? ''
+    while (rest !== '') {
+      const at = rest.indexOf(MARK)
+      if (at === -1) { out.push({ kind: 'text', text: rest }); rest = ''; break }
+      if (at > 0) out.push({ kind: 'text', text: rest.slice(0, at) })
+      /* JSON 参数里可能含 "]"（比如命令串），所以不能见 ] 就收——
+         从最近的 ] 逐个往后试，能把 body 解析成「名字 + 合法 JSON」的那个才算闭合。 */
+      let closedAt = -1
+      for (let pos = rest.indexOf(']', at); pos !== -1; pos = rest.indexOf(']', pos + 1)) {
+        const candidate = rest.slice(at + MARK.length, pos).trim()
+        const sepAt = candidate.indexOf('：')
+        const name = sepAt === -1 ? candidate : candidate.slice(0, sepAt).trim()
+        const argsRaw = sepAt === -1 ? '' : candidate.slice(sepAt + 1).trim()
+        try { JSON.parse(argsRaw === '' ? '{}' : argsRaw) } catch { continue }
+        closedAt = pos
+        break
+      }
+      if (closedAt === -1) {
+        /* 没有能闭合的位置：可能是截断。整段吐回文本，不再解析。 */
+        out.push({ kind: 'text', text: rest.slice(at) })
+        rest = ''
+        break
+      }
+      const body = rest.slice(at + MARK.length, closedAt).trim()
+      rest = rest.slice(closedAt + 1)
+      const sep = body.indexOf('：')
+      const name = sep === -1 ? body.trim() : body.slice(0, sep).trim()
+      const argsRaw = sep === -1 ? '' : body.slice(sep + 1).trim()
+      let args = '{}'
+      try { args = JSON.stringify(JSON.parse(argsRaw === '' ? '{}' : argsRaw)) } catch { args = null }
+      if (name === '' || args === null) {
+        /* 名字为空或 JSON 解不开：当普通文本处理，不能给宿主一个坏调用 */
+        out.push({ kind: 'text', text: `${MARK}${body}]` })
+      } else {
+        out.push({ kind: 'tool-call', name, arguments: args })
+      }
+    }
+  }
+  return out
+}
+
 /**
  * 把 DSH 的消息数组渲染成给本地 opencode 的一次性 prompt。
  * 图片/附件只留占位说明（代发通道是纯文本）；总量有上限，防止把本地服务压死。
  */
-function renderBridgePrompt(messages, entry) {
+function renderBridgePrompt(messages, entry, tools) {
   const parts = []
   const LIMIT = 400000
   let total = 0
@@ -953,7 +1089,7 @@ function renderBridgePrompt(messages, entry) {
     if (total > LIMIT) break
     parts.push(line)
   }
-  parts.push('（以上是一整轮的完整对话。请以 Assistant 身份直接回复最后一条 User 消息，不要调用任何工具，不要复述本段说明。）')
+  parts.push(bridgeToolPreamble(tools))
   return parts.join('\n\n')
 }
 

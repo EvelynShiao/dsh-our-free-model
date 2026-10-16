@@ -200,25 +200,86 @@ function headers(svc) {
 }
 
 /**
- * 建一个真实会话。
+ * 桥接专用 agent 名。
+ *
+ * 2026-10-16 实锤（「调不动工具」根因）：opencode 服务给每个会话注入自己的系统
+ * 提示词 + 一整套原生工具（shell/read/write/execute…）。模型面对「DSH 的文本格式
+ * 调用」和「opencode 的原生工具」两头看，经常叛变到原生通道——在 opencode 内部
+ * 执行完毕，我们一个字节都看不到，DSH 只收到空文本。
+ *
+ * 解法：在 ~/.config/opencode/opencode.json 里养一个专用 agent（mute2），
+ * 用 tools 开关把危险原生工具砍掉（只留 glob/grep/read 这些无害只读件），
+ * 模型没有爪子，只能老老实实按文本格式输出。agent 不存在或配置被删时退回
+ * 默认 build——管道仍能用，只是工具协议可能再次失灵（可自愈见 ensurePipeAgent）。
+ */
+export const BRIDGE_AGENT = 'mute2'
+
+/** mute2 的 agent 配置（写进用户 opencode.json 的形状）。 */
+const PIPE_AGENT_CONFIG = {
+  description: 'dsh our-free-model bridge: dumb pipe, dangerous tools off',
+  mode: 'primary',
+  tools: { shell: false, write: false, edit: false, bash: false, webfetch: false, websearch: false, subagent: false, skill: false, execute: false },
+  permissions: [{ action: '*', resource: '*', effect: 'allow' }],
+}
+
+/**
+ * 确保 ~/.config/opencode/opencode.json 里有桥接 agent。
+ * 幂等：已存在且配置一致就不动用户文件；存在但形状不对才补写。
+ * 失败不抛——agent 缺席时管道退回 build，功能还在。
+ */
+export function ensurePipeAgent() {
+  try {
+    const cfgPath = join(homedir(), '.config', 'opencode', 'opencode.json')
+    let cfg = {}
+    try { cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8')) } catch { /* 首次创建 */ }
+    const agents = (cfg.agent = cfg.agent && typeof cfg.agent === 'object' ? cfg.agent : {})
+    const existing = agents[BRIDGE_AGENT]
+    const wanted = JSON.stringify(PIPE_AGENT_CONFIG)
+    if (existing !== undefined && JSON.stringify(existing) === wanted) return true
+    agents[BRIDGE_AGENT] = PIPE_AGENT_CONFIG
+    fs.mkdirSync(join(cfgPath, '..'), { recursive: true })
+    fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2))
+    return true
+  } catch { return false }
+}
+
+/**
+ * 建一个真实会话（走桥接专用 mute2 agent）。
  * @param {{url:string,password:string}} svc
  * @param {string} modelId - zen 模型 id（如 mimo-v2.6-flash-free）
  * @param {string} directory - 工作目录（服务要求一个 location）
  */
 export async function createSession(svc, modelId, directory, signal) {
+  ensurePipeAgent()
   const res = await fetch(`${svc.url}/api/session`, {
     method: 'POST',
     headers: headers(svc),
-    body: JSON.stringify({ location: { directory }, model: { providerID: 'opencode', id: modelId } }),
+    body: JSON.stringify({ agent: BRIDGE_AGENT, location: { directory }, model: { providerID: 'opencode', id: modelId } }),
     signal: signal ?? AbortSignal.timeout(15000),
   });
-  const text = await res.text();
-  if (!res.ok) throw new Error(`opencode 建会话失败 HTTP ${res.status}: ${text.slice(0, 200)}`);
-  let doc;
-  try { doc = JSON.parse(text); } catch { throw new Error(`opencode 建会话返回非 JSON: ${text.slice(0, 120)}`); }
-  const id = doc?.data?.id;
+  let doc = await parseJsonResponse(res, 'opencode 建会话失败');
+  let id = doc?.data?.id;
+  /* agent 刚写入时服务端注册表可能没热好（实测"Agent not found"一次）：
+     退回 build 重试一次，管道保命。 */
+  if (res.status === 503 && typeof doc?.message === 'string' && doc.message.includes('Agent not found')) {
+    const retry = await fetch(`${svc.url}/api/session`, {
+      method: 'POST',
+      headers: headers(svc),
+      body: JSON.stringify({ agent: 'build', location: { directory }, model: { providerID: 'opencode', id: modelId } }),
+      signal: signal ?? AbortSignal.timeout(15000),
+    });
+    doc = await parseJsonResponse(retry, 'opencode 建会话失败');
+    id = doc?.data?.id;
+  }
   if (typeof id !== 'string' || !id.startsWith('ses_')) throw new Error('opencode 建会话没有返回会话 id');
   return { id, projectID: doc?.data?.projectID ?? '' };
+}
+
+/** 共用的响应解析：非 2xx 抛错，非 JSON 抛错，返回 doc。 */
+async function parseJsonResponse(res, label) {
+  const text = await res.text();
+  if (!res.ok) throw new Error(`${label} HTTP ${res.status}: ${text.slice(0, 200)}`);
+  try { return JSON.parse(text); } catch { throw new Error(`${label} 返回非 JSON: ${text.slice(0, 120)}`); }
 }
 
 /** 会话内一次性生成文本（免费车道代发）。 */
@@ -226,13 +287,10 @@ export async function generateInSession(svc, sessionId, modelId, prompt, signal)
   const res = await fetch(`${svc.url}/api/session/${encodeURIComponent(sessionId)}/generate`, {
     method: 'POST',
     headers: headers(svc),
-    body: JSON.stringify({ prompt, model: { providerID: 'opencode', id: modelId } }),
+    body: JSON.stringify({ prompt }),
     signal: signal ?? AbortSignal.timeout(300000),
   });
-  const text = await res.text();
-  if (!res.ok) throw new Error(`opencode generate 失败 HTTP ${res.status}: ${text.slice(0, 200)}`);
-  let doc;
-  try { doc = JSON.parse(text); } catch { throw new Error(`opencode generate 返回非 JSON: ${text.slice(0, 120)}`); }
+  const doc = await parseJsonResponse(res, 'opencode generate 失败');
   const out = doc?.data?.text;
   if (typeof out !== 'string') throw new Error('opencode generate 没有返回文本');
   return out;
