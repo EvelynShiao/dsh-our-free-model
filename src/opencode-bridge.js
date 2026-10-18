@@ -423,11 +423,24 @@ export function assertFreeModel(modelId) {
  */
 export async function bridgeStream({ modelId, prompt, directory, signal, onDelta, onReasoning, onUsage, autostart = bridgeConfig.autostart }) {
   const id = assertFreeModel(modelId)
-  const svc = await ensureService({ autostart })
+  let svc = await ensureService({ autostart })
   if (svc === null) throw new Error(BRIDGE_HINT);
   noteBridgeUse()
   const dir = directory ?? process.env.DSH_HOME ?? homedir();
-  const session = await createSession(svc, id, dir, signal);
+  let session;
+  try {
+    session = await createSession(svc, id, dir, signal);
+  } catch (error) {
+    if (signal?.aborted === true) throw error;
+    /* 冷启动竞态（2026-10-18）：ensureService 判定服务已就绪，但服务在紧接着建会话
+       之前退出（端口被抢 / 启动即崩 / service.json 过期），这一轮就会以 fetch failed
+       收场。重探一次再试，把「重启后第一条消息必挂」压成偶发；第二次仍失败就如实抛出，
+       不无限重试。readService/ensureService 都无缓存，重试拿到的是最新状态。 */
+    const retried = await ensureService({ autostart });
+    if (retried === null) throw error;
+    svc = retried;
+    session = await createSession(svc, id, dir, signal);
+  }
 
   const ac = new AbortController();
   const onOuter = () => ac.abort(signal?.reason);

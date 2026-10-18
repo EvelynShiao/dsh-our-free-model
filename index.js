@@ -1463,10 +1463,24 @@ export function apply(ctx, config) {
       const selection = event.data
       if (selection?.provider !== 'our-free-model') return
       if (typeof selection.model !== 'string' || !selection.model.endsWith('-free')) return
-      void ensureService({ autostart: true }).catch(() => {})
+      /* 延后一个 tick：事件回调里不做重活，任何异常都不许外溢到宿主。 */
+      setTimeout(() => {
+        try { void ensureService({ autostart: true }).catch(() => {}) } catch { /* 预热失败不影响 DSH */ }
+      }, 0)
     })
-    return () => { off?.() }
-  }, 'our-free-model: warm bridge on model selection')
+    /* 启动预热（2026-10-18 补）：DSH 重启后会话的模型是从持久化恢复的，**不会**产生
+       model/selection 事件；只监听事件会漏掉「重启后第一次发消息」——那时服务仍是停的，
+       于是第一条消息先撞一次 BRIDGE_FAILED。这里在启动稳定后补一次预热，让重启后的
+       第一条消息也能直接命中。延迟 2s 避开启动高峰；unref 不拖住进程。 */
+    const bootTimer = setTimeout(() => {
+      try { void ensureService({ autostart: true }).catch(() => {}) } catch { /* 预热失败不影响 DSH */ }
+    }, 2000)
+    bootTimer.unref?.()
+    return () => {
+      if (typeof off === 'function') off()
+      clearTimeout(bootTimer)
+    }
+  }, 'our-free-model: warm bridge on model selection + boot')
 
   ctx.effect(() => () => {
     disposed = true

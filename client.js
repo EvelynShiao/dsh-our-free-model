@@ -138,8 +138,9 @@ window.__ModuleLoader__.load({
         'egress.direct': '关闭时请求直连发出；订阅地址按密钥对待——只存在本机设置里，不随常规接口数据下发，仅点「显示」时读取，面板默认打码。',
         'egress.error': '出口启动失败：{message}',
         'bridge.autostart': '使用时自动拉起本机服务',
-        'bridge.idleStop': '闲置自动关闭（分钟，0 = 常驻）',
-        'bridge.hint': '本地 opencode 服务常驻约占 250~550 MB 内存；闲置自动关闭后，下次用免费模型约 0.5 秒重新拉起。关掉「自动拉起」则只在服务已在跑时可用（可手动执行 opencode service start）。服务上若有别的会话在活动，自动关闭会自动推迟，不会误杀。',
+        'bridge.idleStop': '闲置自动关闭（单位：分钟；0 = 常驻不关）',
+        'bridge.idleStopEcho': '当前 {n} 分钟 = {s} 秒后关停',
+        'bridge.hint': '单位是分钟，不是秒：填 1 就是 60 秒，填 10 就是 10 分钟。本地 opencode 服务常驻约占 250~550 MB 内存；闲置自动关闭后，下次用免费模型约 0.5 秒重新拉起。关掉「自动拉起」则只在服务已在跑时可用（可手动执行 opencode service start）。服务上若有别的会话在活动，自动关闭会自动推迟，不会误杀。',
         'section.prefs': '插件设置',
         'section.prefsHint': '改动在下一次加载完全生效。',
         'heat.title': 'Token 热力图',
@@ -707,8 +708,9 @@ window.__ModuleLoader__.load({
         'egress.direct': 'While off, requests go direct; the address is treated as a credential — kept in this machine\'s settings only, never sent down with the regular API payloads, readable only through the reveal button, masked here by default.',
         'egress.error': 'The outlet failed to start: {message}',
         'bridge.autostart': 'Auto-start the local service on use',
-        'bridge.idleStop': 'Idle auto-stop (minutes, 0 = keep running)',
-        'bridge.hint': 'A resident opencode service costs ~250-550 MB; after an idle stop the next free-model use re-spawns it in ~0.5 s. With auto-start off, the lane only works while the service is already running (start it manually with `opencode service start`). An idle stop is postponed while any other session is active on the service.',
+        'bridge.idleStop': 'Idle auto-stop (unit: MINUTES; 0 = keep running)',
+        'bridge.idleStopEcho': 'Currently {n} min = {s} s before stop',
+        'bridge.hint': 'The unit is minutes, not seconds: 1 means 60 s, 10 means 10 min. A resident opencode service costs ~250-550 MB; after an idle stop the next free-model use re-spawns it in ~0.5 s. With auto-start off, the lane only works while the service is already running (start it manually with `opencode service start`). An idle stop is postponed while any other session is active on the service.',
         'section.prefs': 'Plugin settings',
         'section.prefsHint': 'Changes take full effect on the next load.',
         'pool.levelOk': 'Healthy',
@@ -1312,6 +1314,10 @@ window.__ModuleLoader__.load({
 /* ══ 区块与分节 ════════════════════════════════════════════════════════ */
 .ofm_sec{display:flex;flex-direction:column;gap:10px}
 .ofm_sechead{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;padding-bottom:6px;border-bottom:1px solid var(--dsw-alias-border-l1)}
+.ofm_sechead_click{cursor:pointer;user-select:none;-webkit-user-select:none;border-radius:6px;padding:6px 4px;transition:background-color .12s ease}
+.ofm_sechead_click:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(127,127,127,.08))}
+.ofm_sechead_click:focus-visible{outline:2px solid var(--dsw-alias-border-l2,rgba(127,127,127,.5));outline-offset:2px}
+.ofm_sec_caret{display:inline-block;width:1em;flex:0 0 auto;font-size:11px;line-height:1;color:var(--dsw-alias-label-tertiary);transform:translateY(-1px)}
 .ofm_sec_title{font-size:14px;font-weight:680;letter-spacing:-.2px}
 .ofm_sec_hint{font-size:11.5px;color:var(--dsw-alias-label-tertiary);margin-left:auto}
 .ofm_grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(252px,1fr));gap:10px}
@@ -2532,11 +2538,28 @@ window.__ModuleLoader__.load({
     }, props.children)
 
     function Section(props) {
-      return h('section', { className: 'ofm_sec' },
-        h('div', { className: 'ofm_sechead' },
+      /* 默认折叠（2026-10-18）：手机上这一页有十几个大项，全展开一次渲染上百个
+         控件，滚动和重排都卡。折叠状态只存在组件内存里，不写设置、不改协议；
+         点标题栏或按回车/空格切换，键盘可达。 */
+      const [open, setOpen] = useState(false)
+      const toggle = () => setOpen(value => !value)
+      return h('section', { className: 'ofm_sec' + (open ? ' ofm_sec_open' : '') },
+        h('div', {
+          className: 'ofm_sechead ofm_sechead_click',
+          role: 'button',
+          tabIndex: 0,
+          'aria-expanded': open ? 'true' : 'false',
+          onClick: toggle,
+          onKeyDown: event => {
+            if (event.key !== 'Enter' && event.key !== ' ') return
+            event.preventDefault()
+            toggle()
+          },
+        },
+          h('span', { className: 'ofm_sec_caret', 'aria-hidden': 'true' }, open ? '▾' : '▸'),
           h('span', { className: 'ofm_sec_title' }, props.title),
           props.hint === undefined ? null : h('span', { className: 'ofm_sec_hint' }, props.hint)),
-        props.children)
+        open ? props.children : null)
     }
 
     function Panel(props) {
@@ -3364,6 +3387,13 @@ window.__ModuleLoader__.load({
           h(Switch, { checked: draft?.bridge?.autostart !== false, label: t('bridge.autostart'), onChange: () => setDraft(c => ({ ...c, bridge: { ...(c.bridge ?? {}), autostart: !(c?.bridge?.autostart !== false) } })) }),
           field(t('bridge.idleStop'), h('input', { className: 'ofm_input', style: { maxWidth: 100 }, value: draft?.bridge?.idleStopMinutes ?? 10, onChange: e => setDraft(c => ({ ...c, bridge: { ...(c.bridge ?? {}), idleStopMinutes: Number(e.target.value.replace(/\D/g, '')) || 0 } })) })),
           h(Button, { kind: 'primary', disabled: busy, onClick: () => onApply({ bridge: { autostart: draft?.bridge?.autostart !== false, idleStopMinutes: draft?.bridge?.idleStopMinutes ?? 10 } }) }, t('forward.apply'))),
+        /* 把「分钟」当场换算成秒回显，避免再把 1 当成 1 秒（2026-10-18）。 */
+        h('div', { className: 'ofm_note' },
+          (() => {
+            const minutes = Number(draft?.bridge?.idleStopMinutes ?? 10)
+            if (!Number.isFinite(minutes) || minutes <= 0) return t('bridge.idleStopEcho').replace('{n}', '0').replace('{s}', '∞')
+            return t('bridge.idleStopEcho').replace('{n}', String(minutes)).replace('{s}', String(minutes * 60))
+          })()),
         h('div', { className: 'ofm_note' }, t('bridge.hint')),
         h('div', { className: 'ofm_row', style: { gap: 8 } },
           h('span', { className: 'ofm_pill' }, `${t('pref.egress')}: ${summary.egress?.ip ?? '—'}${summary.egress?.country ? ` (${summary.egress.country})` : ''}`),
