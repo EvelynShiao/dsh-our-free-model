@@ -409,6 +409,16 @@ export class FreeModelAdapter {
     try { await run; failure = null } catch (error) { failure = error }
 
     if (failure !== null && !sawText && !sawToolCall) {
+      /* 2026-10-18：这条失败路径此前不留任何痕迹，线上只能看到一句 fetch failed，
+         排查时无法区分「服务没起来」「起来了但立刻死」「端口探测误判」。把决策依据
+         一次性记全：耗时、当前 service.json、CLI 是否在、信号是否已中止。 */
+      const service = readService()
+      this.deps.warn?.(
+        `our-free-model: bridge 失败 model=${entry.id} elapsedMs=${Date.now() - started}`
+        + ` service=${service === null ? 'none' : service.url}`
+        + ` cli=${hasOpencodeCli()} aborted=${options.signal?.aborted === true}`
+        + ` reason=${String(failure?.message ?? failure)}`,
+      )
       this.deps.recordTurn?.({ at: started, model: entry.id, ok: false, recovered: false, attempts: 1, origin: 'harness' })
       yield {
         type: 'finish',

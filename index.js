@@ -31,6 +31,7 @@ import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { ROUTE_LABELS, ROUTE_MAIN, ROUTE_REGION } from './src/adapter.js'
 import { DATA_DIR_NAME, decodeWindow, resolveDshHome } from './src/store.js'
+import { configureBridge, ensureService } from './src/opencode-bridge.js'
 import { isEacEntry, isKiloEntry } from './src/catalog.js'
 import { STATE } from './src/probe.js'
 import { generateKey, rankLanAddresses, startForwardServer, startLanRelay } from './src/forward.js'
@@ -168,6 +169,9 @@ export function apply(ctx, config) {
 
   const stores = createRuntimeStores({ dataDir, logger })
   const { settings, stats, availability } = stores
+
+  // 本地 opencode 桥接的行为（自动拉起 / 闲置自动关）从设置注入，启动即生效。
+  configureBridge(settings.get().bridge)
 
   if (generation > 1) {
     settings.update({ reloadedAt: Date.now(), reloadCount: generation - 1 })
@@ -1444,6 +1448,26 @@ export function apply(ctx, config) {
 
   ctx.effect(() => () => { registration() }, 'our-free-model: adapter routes')
 
+  /* 切到免费车道模型即预热本机 opencode 服务（2026-10-18）。
+     动机：服务改成按需启动后，只有「发消息」才会 ensureService；用户在下拉里选完
+     免费模型到真正发出请求之间那段空窗，服务仍是停的。跨夜/闲置后第一次切换时，
+     这一轮请求会先撞一次 BRIDGE_FAILED（fetch failed），体验上像「一选这个模型就断线」。
+     这里在 model/selection 落盘时就把它拉起来：实测启动约 0.8s，远小于用户从选模型到
+     敲完第一句话的间隔。ensureService 内部有 pendingStart 幂等保护，连点模型不会起多个
+     进程；服务已在跑时 readService+portOpen 直接返回，几乎零成本。
+     手机端无本地 opencode 时 readService()/hasOpencodeCli() 都为假，ensureService 返回
+     null，不报错也不启动任何东西，行为与打补丁前一致。 */
+  ctx.effect(() => {
+    const off = ctx.on('session/event', (_session, event) => {
+      if (event?.type !== 'model/selection') return
+      const selection = event.data
+      if (selection?.provider !== 'our-free-model') return
+      if (typeof selection.model !== 'string' || !selection.model.endsWith('-free')) return
+      void ensureService({ autostart: true }).catch(() => {})
+    })
+    return () => { off?.() }
+  }, 'our-free-model: warm bridge on model selection')
+
   ctx.effect(() => () => {
     disposed = true
     eacLoginPoller.reset()
@@ -1879,7 +1903,7 @@ function createApiRoutes(deps) {
       if (method === 'POST' && routePath === '/settings') {
         const patch = await readJson(req)
         const current = deps.settings.get()
-        const next = sanitizeSettings({ ...current, ...pick(patch, ['enabled', 'exposeRegionModels', 'probeIntervalMinutes', 'defaultMaxTokens', 'announcementAck', 'feedUrl', 'feedPollMinutes', 'notifyOs', 'updateCheckHours', 'autoReloadWatch']) }, current)
+        const next = sanitizeSettings({ ...current, ...pick(patch, ['enabled', 'exposeRegionModels', 'probeIntervalMinutes', 'defaultMaxTokens', 'announcementAck', 'feedUrl', 'feedPollMinutes', 'notifyOs', 'updateCheckHours', 'autoReloadWatch', 'bridge']) }, current)
         if (patch.forward !== undefined) {
           const forward = { ...(current.forward ?? {}), ...pick(patch.forward, ['enabled', 'host', 'port']) }
           // The listener spends this machine's lane, and a routable bind address
@@ -1926,8 +1950,22 @@ function createApiRoutes(deps) {
           }
           next.egress = egress
         }
+        if (patch.bridge !== undefined) {
+          // 桥接行为：autostart 布尔；idleStopMinutes 0~240 分钟（0 = 常驻不自动关）。
+          const bridge = { ...(current.bridge ?? {}), ...pick(patch.bridge, ['autostart', 'idleStopMinutes']) }
+          if (patch.bridge.autostart !== undefined) bridge.autostart = patch.bridge.autostart === true
+          if (patch.bridge.idleStopMinutes !== undefined) {
+            const minutes = Number(patch.bridge.idleStopMinutes)
+            bridge.idleStopMinutes = Number.isFinite(minutes) && minutes >= 0
+              ? Math.min(240, Math.trunc(minutes))
+              : (Number(current.bridge?.idleStopMinutes) || 0)
+          }
+          next.bridge = bridge
+        }
         deps.settings.update(next)
         deps.settings.flush()
+        // 新桥接行为立即注入运行中的服务（改 0 立即取消看门狗，改 >0 立即重排）。
+        configureBridge(next.bridge)
         await deps.syncForward()
         await deps.syncRelay()
         await deps.syncEgress()
@@ -2250,6 +2288,10 @@ function publicSettings(settings, forwardInfo, egressInfo) {
     exposeRegionModels: settings.exposeRegionModels !== false,
     probeIntervalMinutes: settings.probeIntervalMinutes ?? 15,
     defaultMaxTokens: settings.defaultMaxTokens ?? 0,
+    bridge: {
+      autostart: settings.bridge?.autostart !== false,
+      idleStopMinutes: settings.bridge?.idleStopMinutes ?? 10,
+    },
     announcementAck: settings.announcementAck ?? '',
     feedUrl: typeof settings.feedUrl === 'string' ? settings.feedUrl : '',
     feedPollMinutes: settings.feedPollMinutes ?? 30,

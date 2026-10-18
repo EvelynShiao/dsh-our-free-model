@@ -39,7 +39,7 @@ export const BRIDGE_HINT =
 
 /** 服务没跑时的探针说明——按需启动模式下这是正常状态，不是故障。 */
 export const BRIDGE_IDLE_HINT =
-  '本机 opencode 服务未启动（按需启动：第一次用免费模型时自动拉起，约 0.5 秒）';
+  '本机 opencode 服务未启动（按需启动：第一次用免费模型时自动拉起，约 0.5 秒；闲置后按设置自动退出）';
 
 const UA_FALLBACK = 'opencode/latest/2.0.29/cli';
 
@@ -94,6 +94,99 @@ export function readService() {
 
 const START_TIMEOUT_MS = 10_000;
 
+/* ------------------------------------------------------------------ *
+ * 桥接服务行为配置 + 闲置自动退出（2026-10-16）
+ *
+ * 服务一旦被拉起就常驻（实测工作集 254 MB / 私有 552 MB，用户不想白养）。
+ *   - configureBridge({ autostart, idleStopMinutes })：设置页注入，即时生效；
+ *     autostart=false 绝不自动拉起；idleStopMinutes=0 不自动关；>0 闲置即收。
+ *   - 看门狗在每次真实使用后重排：闲置 N 分钟 → 先查服务上有没有**别人**的
+ *     会话在窗口内活动（用户自己在用 opencode 就不能杀），没有才
+ *     `opencode service stop`。下次要用由 ensureService 约 0.4 秒拉起。
+ * ------------------------------------------------------------------ */
+
+let bridgeConfig = { autostart: true, idleStopMinutes: 10 };
+
+/** 设置页/宿主注入桥接行为；传 {} 只读当前值。即时生效（重排/取消看门狗）。 */
+export function configureBridge(next = {}) {
+  if (typeof next.autostart === 'boolean') bridgeConfig.autostart = next.autostart;
+  if (next.idleStopMinutes !== undefined) {
+    const n = Number(next.idleStopMinutes);
+    bridgeConfig.idleStopMinutes = Number.isFinite(n) && n >= 0
+      ? Math.min(240, Math.trunc(n))
+      : (Number.isFinite(bridgeConfig.idleStopMinutes) ? bridgeConfig.idleStopMinutes : 10);
+  }
+  applyIdlePolicy();
+  return { ...bridgeConfig };
+}
+
+/** 当前桥接行为（设置页回显用）。 */
+export function bridgeConfigNow() {
+  return { ...bridgeConfig };
+}
+
+let idleTimer = null;
+let lastBridgeUseAt = 0;
+
+/** 服务上最近 windowMs 内有没有会话活动——有就是「别人在用」，不能停。 */
+async function serviceBusyWithin(svc, windowMs) {
+  try {
+    const res = await fetch(`${svc.url}/api/session`, { headers: headers(svc), signal: AbortSignal.timeout(4000) });
+    if (!res.ok) return false;
+    const doc = await res.json();
+    const list = Array.isArray(doc) ? doc : doc?.data ?? [];
+    const cutoff = Date.now() - windowMs;
+    for (const s of list) {
+      const updated = Number(s?.time?.updated ?? s?.time?.created ?? 0);
+      if (Number.isFinite(updated) && updated > cutoff) return true;
+    }
+  } catch { /* 服务已不在/瞬时抖动 → 视为不忙 */ }
+  return false;
+}
+
+/** 按当前 idleStopMinutes 重排（或取消）闲置计时。 */
+function scheduleIdleStop() {
+  if (idleTimer !== null) { clearTimeout(idleTimer); idleTimer = null; }
+  const waitMs = bridgeConfig.idleStopMinutes * 60_000;
+  if (!(waitMs > 0)) return;
+  idleTimer = setTimeout(() => {
+    idleTimer = null;
+    void (async () => {
+      if (Date.now() - lastBridgeUseAt < waitMs - 1500) { scheduleIdleStop(); return; }
+      const svc = readService();
+      if (svc === null) return; /* 已经停了，无事可做 */
+      if (await serviceBusyWithin(svc, waitMs)) { scheduleIdleStop(); return; }
+      const cli = opencodeCli();
+      try {
+        const child = spawn(cli.file, ['service', 'stop'], {
+          detached: true,
+          stdio: 'ignore',
+          windowsHide: true,
+          shell: cli.viaShell,
+        });
+        child.unref();
+      } catch { /* 停失败也无害：下次使用时 ensureService 会自己处理 */ }
+    })();
+  }, waitMs);
+  // 看门狗绝不许把 DSH 进程拖住。
+  idleTimer.unref?.();
+}
+
+/** 每次真实使用桥接时调用：记活跃时刻 + 重排计时。 */
+function noteBridgeUse() {
+  lastBridgeUseAt = Date.now();
+  scheduleIdleStop();
+}
+
+/** 配置变化后立即按新策略生效（改成 0 立即取消；改成 >0 立即重排）。 */
+function applyIdlePolicy() {
+  if (!(bridgeConfig.idleStopMinutes > 0)) {
+    if (idleTimer !== null) { clearTimeout(idleTimer); idleTimer = null; }
+    return;
+  }
+  if (lastBridgeUseAt > 0) scheduleIdleStop();
+}
+
 /** 找 opencode 可执行文件；都找不到就退回 PATH 里的 `opencode`。 */
 function opencodeCli() {
   const home = homedir();
@@ -147,7 +240,7 @@ let pendingStart = null;
  * @param {{autostart?:boolean}} options autostart:false = 只查不启动（探针用）
  * @returns {Promise<{url:string,password:string}|null>}
  */
-export async function ensureService({ autostart = true } = {}) {
+export async function ensureService({ autostart = bridgeConfig.autostart } = {}) {
   const current = readService();
   if (current !== null && await portOpen(current.url)) return current;
   if (autostart !== true) return null;
@@ -328,10 +421,11 @@ export function assertFreeModel(modelId) {
  *          onUsage?:(tokens:object)=>void}} options
  * @returns {Promise<string>} 全文
  */
-export async function bridgeStream({ modelId, prompt, directory, signal, onDelta, onReasoning, onUsage, autostart = true }) {
+export async function bridgeStream({ modelId, prompt, directory, signal, onDelta, onReasoning, onUsage, autostart = bridgeConfig.autostart }) {
   const id = assertFreeModel(modelId)
   const svc = await ensureService({ autostart })
   if (svc === null) throw new Error(BRIDGE_HINT);
+  noteBridgeUse()
   const dir = directory ?? process.env.DSH_HOME ?? homedir();
   const session = await createSession(svc, id, dir, signal);
 
@@ -416,10 +510,11 @@ export async function bridgeStream({ modelId, prompt, directory, signal, onDelta
  * @param {{modelId:string, prompt:string, directory?:string, signal?:AbortSignal}} options
  * @returns {Promise<string>} 模型输出文本
  */
-export async function bridgeGenerate({ modelId, prompt, directory, signal, autostart = true }) {
+export async function bridgeGenerate({ modelId, prompt, directory, signal, autostart = bridgeConfig.autostart }) {
   const id = assertFreeModel(modelId);
   const svc = await ensureService({ autostart });
   if (svc === null) throw new Error(BRIDGE_HINT);
+  noteBridgeUse()
   const dir = directory ?? process.env.DSH_HOME ?? homedir();
   const session = await createSession(svc, id, dir, signal);
   return generateInSession(svc, session.id, id, prompt, signal);
