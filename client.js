@@ -138,9 +138,9 @@ window.__ModuleLoader__.load({
         'egress.direct': '关闭时请求直连发出；订阅地址按密钥对待——只存在本机设置里，不随常规接口数据下发，仅点「显示」时读取，面板默认打码。',
         'egress.error': '出口启动失败：{message}',
         'bridge.autostart': '使用时自动拉起本机服务',
-        'bridge.idleStop': '闲置自动关闭（单位：分钟；0 = 常驻不关）',
-        'bridge.idleStopEcho': '当前 {n} 分钟 = {s} 秒后关停',
-        'bridge.hint': '单位是分钟，不是秒：填 1 就是 60 秒，填 10 就是 10 分钟。本地 opencode 服务常驻约占 250~550 MB 内存；闲置自动关闭后，下次用免费模型约 0.5 秒重新拉起。关掉「自动拉起」则只在服务已在跑时可用（可手动执行 opencode service start）。服务上若有别的会话在活动，自动关闭会自动推迟，不会误杀。',
+        'bridge.idleStop': '闲置自动关闭（单位：秒；0 = 常驻不关）',
+        'bridge.idleStopEcho': '当前 {s} 秒（{m} 分钟）后关停；0 = 常驻',
+        'bridge.hint': '单位是秒：填 60 就是一分钟后关停。本地 opencode 服务常驻约占 250~550 MB 内存；闲置自动关闭后，下次用免费模型约 0.5 秒重新拉起。关掉「自动拉起」则只在服务已在跑时可用（可手动执行 opencode service start）。服务上若有别的会话在活动，自动关闭会自动推迟，不会误杀。',
         'section.prefs': '插件设置',
         'section.prefsHint': '改动在下一次加载完全生效。',
         'heat.title': 'Token 热力图',
@@ -708,9 +708,9 @@ window.__ModuleLoader__.load({
         'egress.direct': 'While off, requests go direct; the address is treated as a credential — kept in this machine\'s settings only, never sent down with the regular API payloads, readable only through the reveal button, masked here by default.',
         'egress.error': 'The outlet failed to start: {message}',
         'bridge.autostart': 'Auto-start the local service on use',
-        'bridge.idleStop': 'Idle auto-stop (unit: MINUTES; 0 = keep running)',
-        'bridge.idleStopEcho': 'Currently {n} min = {s} s before stop',
-        'bridge.hint': 'The unit is minutes, not seconds: 1 means 60 s, 10 means 10 min. A resident opencode service costs ~250-550 MB; after an idle stop the next free-model use re-spawns it in ~0.5 s. With auto-start off, the lane only works while the service is already running (start it manually with `opencode service start`). An idle stop is postponed while any other session is active on the service.',
+        'bridge.idleStop': 'Idle auto-stop (unit: SECONDS; 0 = keep running)',
+        'bridge.idleStopEcho': 'Currently {s} s ({m} min) before stop; 0 = keep running',
+        'bridge.hint': 'The unit is seconds: 60 stops the service after one idle minute. A resident opencode service costs ~250-550 MB; after an idle stop the next free-model use re-spawns it in ~0.5 s. With auto-start off, the lane only works while the service is already running (start it manually with `opencode service start`). An idle stop is postponed while any other session is active on the service.',
         'section.prefs': 'Plugin settings',
         'section.prefsHint': 'Changes take full effect on the next load.',
         'pool.levelOk': 'Healthy',
@@ -3385,14 +3385,35 @@ window.__ModuleLoader__.load({
           h(Button, { kind: 'primary', disabled: busy, onClick: () => onApply({ probeIntervalMinutes: draft.probeIntervalMinutes, defaultMaxTokens: draft.defaultMaxTokens }) }, t('forward.apply'))),
         h('div', { className: 'ofm_row' },
           h(Switch, { checked: draft?.bridge?.autostart !== false, label: t('bridge.autostart'), onChange: () => setDraft(c => ({ ...c, bridge: { ...(c.bridge ?? {}), autostart: !(c?.bridge?.autostart !== false) } })) }),
-          field(t('bridge.idleStop'), h('input', { className: 'ofm_input', style: { maxWidth: 100 }, value: draft?.bridge?.idleStopMinutes ?? 10, onChange: e => setDraft(c => ({ ...c, bridge: { ...(c.bridge ?? {}), idleStopMinutes: Number(e.target.value.replace(/\D/g, '')) || 0 } })) })),
-          h(Button, { kind: 'primary', disabled: busy, onClick: () => onApply({ bridge: { autostart: draft?.bridge?.autostart !== false, idleStopMinutes: draft?.bridge?.idleStopMinutes ?? 10 } }) }, t('forward.apply'))),
-        /* 把「分钟」当场换算成秒回显，避免再把 1 当成 1 秒（2026-10-18）。 */
+          /* 2026-10-18：单位改秒（默认 60）。旧存量是分钟：>=1 的旧值换算 ×60 显示，
+             应用一次后设置里存的就是秒，此后原样显示。 */
+          (() => {
+            const raw = draft?.bridge
+            const legacySeconds = raw?.idleStopSeconds === undefined && raw?.idleStopMinutes !== undefined
+              ? Math.max(0, Math.trunc(Number(raw.idleStopMinutes) || 0)) * 60
+              : undefined
+            const seconds = raw?.idleStopSeconds ?? legacySeconds ?? 60
+            const setSeconds = value => setDraft(c => ({ ...c, bridge: { ...(c.bridge ?? {}), idleStopSeconds: value } }))
+            return field(t('bridge.idleStop'), h('input', { className: 'ofm_input', style: { maxWidth: 100 }, value: seconds, onChange: e => setSeconds(Number(e.target.value.replace(/\D/g, '')) || 0) }))
+          })(),
+          h(Button, { kind: 'primary', disabled: busy, onClick: () => {
+            const raw = draft?.bridge
+            const legacySeconds = raw?.idleStopSeconds === undefined && raw?.idleStopMinutes !== undefined
+              ? Math.max(0, Math.trunc(Number(raw.idleStopMinutes) || 0)) * 60
+              : undefined
+            const seconds = Math.min(14400, Math.max(0, raw?.idleStopSeconds ?? legacySeconds ?? 60))
+            onApply({ bridge: { autostart: draft?.bridge?.autostart !== false, idleStopSeconds: seconds } })
+          } }, t('forward.apply'))),
+        /* 秒 → 分钟当场换算回显，0 显示常驻。 */
         h('div', { className: 'ofm_note' },
           (() => {
-            const minutes = Number(draft?.bridge?.idleStopMinutes ?? 10)
-            if (!Number.isFinite(minutes) || minutes <= 0) return t('bridge.idleStopEcho').replace('{n}', '0').replace('{s}', '∞')
-            return t('bridge.idleStopEcho').replace('{n}', String(minutes)).replace('{s}', String(minutes * 60))
+            const raw = draft?.bridge
+            const legacySeconds = raw?.idleStopSeconds === undefined && raw?.idleStopMinutes !== undefined
+              ? Math.max(0, Math.trunc(Number(raw.idleStopMinutes) || 0)) * 60
+              : undefined
+            const seconds = raw?.idleStopSeconds ?? legacySeconds ?? 60
+            if (!Number.isFinite(seconds) || seconds <= 0) return t('bridge.idleStopEcho').replace('{s}', '0').replace('{m}', '0')
+            return t('bridge.idleStopEcho').replace('{s}', String(seconds)).replace('{m}', String(Math.round(seconds / 60)))
           })()),
         h('div', { className: 'ofm_note' }, t('bridge.hint')),
         h('div', { className: 'ofm_row', style: { gap: 8 } },

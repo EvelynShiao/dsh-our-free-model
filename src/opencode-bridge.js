@@ -95,29 +95,36 @@ export function readService() {
 const START_TIMEOUT_MS = 10_000;
 
 /* ------------------------------------------------------------------ *
- * 桥接服务行为配置 + 闲置自动退出（2026-10-16）
+ * 桥接服务行为配置 + 闲置自动退出（2026-10-16；2026-10-18 单位改秒）
  *
  * 服务一旦被拉起就常驻（实测工作集 254 MB / 私有 552 MB，用户不想白养）。
- *   - configureBridge({ autostart, idleStopMinutes })：设置页注入，即时生效；
- *     autostart=false 绝不自动拉起；idleStopMinutes=0 不自动关；>0 闲置即收。
- *   - 看门狗在每次真实使用后重排：闲置 N 分钟 → 先查服务上有没有**别人**的
+ *   - configureBridge({ autostart, idleStopSeconds })：设置页注入，即时生效；
+ *     autostart=false 绝不自动拉起；idleStopSeconds=0 不自动关；>0 闲置即收。
+ *   - 看门狗在每次真实使用后重排：闲置 N 秒 → 先查服务上有没有**别人**的
  *     会话在窗口内活动（用户自己在用 opencode 就不能杀），没有才
  *     `opencode service stop`。下次要用由 ensureService 约 0.4 秒拉起。
+ *   - 兼容：仍接受旧的 idleStopMinutes（分钟），收到时×60 折算成秒。
  * ------------------------------------------------------------------ */
 
-let bridgeConfig = { autostart: true, idleStopMinutes: 10 };
+let bridgeConfig = { autostart: true, idleStopSeconds: 60 };
 
 /** 设置页/宿主注入桥接行为；传 {} 只读当前值。即时生效（重排/取消看门狗）。 */
 export function configureBridge(next = {}) {
   if (typeof next.autostart === 'boolean') bridgeConfig.autostart = next.autostart;
-  if (next.idleStopMinutes !== undefined) {
-    const n = Number(next.idleStopMinutes);
-    bridgeConfig.idleStopMinutes = Number.isFinite(n) && n >= 0
-      ? Math.min(240, Math.trunc(n))
-      : (Number.isFinite(bridgeConfig.idleStopMinutes) ? bridgeConfig.idleStopMinutes : 10);
+  if (next.idleStopSeconds !== undefined) {
+    const n = Number(next.idleStopSeconds);
+    bridgeConfig.idleStopSeconds = Number.isFinite(n) && n >= 0
+      ? Math.min(14400, Math.trunc(n))
+      : (Number.isFinite(bridgeConfig.idleStopSeconds) ? bridgeConfig.idleStopSeconds : 60);
+  } else if (next.idleStopMinutes !== undefined) {
+    /* 兼容旧字段（分钟）：settings.json 里存量值与旧 UI 请求仍按分钟解释。 */
+    const m = Number(next.idleStopMinutes);
+    bridgeConfig.idleStopSeconds = Number.isFinite(m) && m >= 0
+      ? Math.min(240, Math.trunc(m)) * 60
+      : (Number.isFinite(bridgeConfig.idleStopSeconds) ? bridgeConfig.idleStopSeconds : 60);
   }
   applyIdlePolicy();
-  return { ...bridgeConfig };
+  return { ...bridgeConfig, idleStopMinutes: Math.round(bridgeConfig.idleStopSeconds / 60) };
 }
 
 /** 当前桥接行为（设置页回显用）。 */
@@ -144,10 +151,10 @@ async function serviceBusyWithin(svc, windowMs) {
   return false;
 }
 
-/** 按当前 idleStopMinutes 重排（或取消）闲置计时。 */
+/** 按当前 idleStopSeconds 重排（或取消）闲置计时。 */
 function scheduleIdleStop() {
   if (idleTimer !== null) { clearTimeout(idleTimer); idleTimer = null; }
-  const waitMs = bridgeConfig.idleStopMinutes * 60_000;
+  const waitMs = bridgeConfig.idleStopSeconds * 1000;
   if (!(waitMs > 0)) return;
   idleTimer = setTimeout(() => {
     idleTimer = null;
@@ -164,6 +171,9 @@ function scheduleIdleStop() {
           windowsHide: true,
           shell: cli.viaShell,
         });
+        /* spawn 失败（ENOENT/权限）经 error 事件异步投递；没有监听器就是
+           unhandled exception，在 DSH fail-loud 下会带走整个 Node 进程。 */
+        child.on('error', () => {});
         child.unref();
       } catch { /* 停失败也无害：下次使用时 ensureService 会自己处理 */ }
     })();
@@ -180,7 +190,7 @@ function noteBridgeUse() {
 
 /** 配置变化后立即按新策略生效（改成 0 立即取消；改成 >0 立即重排）。 */
 function applyIdlePolicy() {
-  if (!(bridgeConfig.idleStopMinutes > 0)) {
+  if (!(bridgeConfig.idleStopSeconds > 0)) {
     if (idleTimer !== null) { clearTimeout(idleTimer); idleTimer = null; }
     return;
   }
@@ -255,6 +265,8 @@ export async function ensureService({ autostart = bridgeConfig.autostart } = {})
         windowsHide: true,
         shell: cli.viaShell,
       });
+      /* 同上：spawn 的失败走 error 事件，必须有人接，否则 fail-loud 连累 Node。 */
+      child.on('error', () => {});
       child.unref();
     } catch { /* 起不来就走下面的超时分支 */ }
     const deadline = Date.now() + START_TIMEOUT_MS;

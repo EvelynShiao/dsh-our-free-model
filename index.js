@@ -171,7 +171,19 @@ export function apply(ctx, config) {
   const { settings, stats, availability } = stores
 
   // 本地 opencode 桥接的行为（自动拉起 / 闲置自动关）从设置注入，启动即生效。
-  configureBridge(settings.get().bridge)
+  // 2026-10-18 单位改秒：存量设置里只有 idleStopMinutes（分钟）时 ×60 迁移为
+  // idleStopSeconds 并立即回写，旧值此后不再生效。
+  {
+    const bridge = settings.get().bridge ?? {}
+    if (bridge.idleStopSeconds === undefined && bridge.idleStopMinutes !== undefined) {
+      const seconds = Math.min(14400, Math.max(0, Math.trunc(Number(bridge.idleStopMinutes) || 0)) * 60)
+      settings.update({ bridge: { ...bridge, idleStopSeconds: seconds } })
+      settings.flush()
+      configureBridge({ ...bridge, idleStopSeconds: seconds })
+    } else {
+      configureBridge(bridge)
+    }
+  }
 
   if (generation > 1) {
     settings.update({ reloadedAt: Date.now(), reloadCount: generation - 1 })
@@ -1965,15 +1977,22 @@ function createApiRoutes(deps) {
           next.egress = egress
         }
         if (patch.bridge !== undefined) {
-          // 桥接行为：autostart 布尔；idleStopMinutes 0~240 分钟（0 = 常驻不自动关）。
-          const bridge = { ...(current.bridge ?? {}), ...pick(patch.bridge, ['autostart', 'idleStopMinutes']) }
+          // 桥接行为：autostart 布尔；idleStopSeconds 0~14400 秒（0 = 常驻不自动关）。
+          // 兼容：旧客户端只发 idleStopMinutes（分钟）时 ×60 折算成秒再存，存量设置自动迁移。
+          const bridge = { ...(current.bridge ?? {}), ...pick(patch.bridge, ['autostart', 'idleStopSeconds', 'idleStopMinutes']) }
           if (patch.bridge.autostart !== undefined) bridge.autostart = patch.bridge.autostart === true
-          if (patch.bridge.idleStopMinutes !== undefined) {
+          if (patch.bridge.idleStopSeconds !== undefined) {
+            const seconds = Number(patch.bridge.idleStopSeconds)
+            bridge.idleStopSeconds = Number.isFinite(seconds) && seconds >= 0
+              ? Math.min(14400, Math.trunc(seconds))
+              : (Number(current.bridge?.idleStopSeconds) || 60)
+          } else if (patch.bridge.idleStopMinutes !== undefined) {
             const minutes = Number(patch.bridge.idleStopMinutes)
-            bridge.idleStopMinutes = Number.isFinite(minutes) && minutes >= 0
-              ? Math.min(240, Math.trunc(minutes))
-              : (Number(current.bridge?.idleStopMinutes) || 0)
+            bridge.idleStopSeconds = Number.isFinite(minutes) && minutes >= 0
+              ? Math.min(240, Math.trunc(minutes)) * 60
+              : (Number(current.bridge?.idleStopSeconds) || 60)
           }
+          if (bridge.idleStopSeconds !== undefined) delete bridge.idleStopMinutes
           next.bridge = bridge
         }
         deps.settings.update(next)
@@ -2304,7 +2323,8 @@ function publicSettings(settings, forwardInfo, egressInfo) {
     defaultMaxTokens: settings.defaultMaxTokens ?? 0,
     bridge: {
       autostart: settings.bridge?.autostart !== false,
-      idleStopMinutes: settings.bridge?.idleStopMinutes ?? 10,
+      idleStopSeconds: settings.bridge?.idleStopSeconds
+        ?? (settings.bridge?.idleStopMinutes !== undefined ? Math.trunc(Number(settings.bridge.idleStopMinutes) || 0) * 60 : 60),
     },
     announcementAck: settings.announcementAck ?? '',
     feedUrl: typeof settings.feedUrl === 'string' ? settings.feedUrl : '',

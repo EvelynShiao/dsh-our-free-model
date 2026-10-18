@@ -207,12 +207,12 @@ export const SETTINGS_INITIAL = {
    *  question with a canned string — each is individually switchable, and the
    *  detector is conservative enough to be off for anything else. */
   localOptimize: { enabled: true, quota: true, prefix: true, title: true, suggestion: true, filepath: true },
-  /** 本地 opencode 桥接服务（免费车道代发）的行为（2026-10-16）。
+  /** 本地 opencode 桥接服务（免费车道代发）的行为（2026-10-16；2026-10-18 单位改秒）。
    *  autostart=false 时绝不自动拉起服务，只用已在跑的（可手动 opencode service start）；
-   *  idleStopMinutes=0 表示不自动关（服务常驻，实测约占 250~550 MB）；
-   *  >0 表示每次用完重新计时，闲置 N 分钟自动 `opencode service stop` 收回内存，
-   *  下次再用约 0.4 秒重新拉起。 */
-  bridge: { autostart: true, idleStopMinutes: 10 },
+   *  idleStopSeconds=0 表示不自动关（服务常驻，实测约占 250~550 MB）；
+   *  >0 表示每次用完重新计时，闲置 N 秒自动 `opencode service stop` 收回内存，
+   *  下次再用约 0.4 秒重新拉起。默认 60 秒（用户指定）。 */
+  bridge: { autostart: true, idleStopSeconds: 60 },
   /** Acknowledged announcement copy version. */
   announcementAck: '',
   /** Last full catalog refresh timestamp. */
