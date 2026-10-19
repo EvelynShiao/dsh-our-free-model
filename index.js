@@ -1470,11 +1470,21 @@ export function apply(ctx, config) {
      手机端无本地 opencode 时 readService()/hasOpencodeCli() 都为假，ensureService 返回
      null，不报错也不启动任何东西，行为与打补丁前一致。 */
   ctx.effect(() => {
+    /* 与 adapter.js 的分流条件严格一致（免费车道判定不再用 '-free' 后缀猜：
+       kilo 模型形如 nvidia/nemotron-3.5-super-vl:free，后缀匹配既会漏它、
+       又会在只该走 EAC/kilo 直连的模型上空拉服务）。选中即预热。 */
+    const wantsBridge = (modelId) => {
+      try {
+        const entry = modelRuntime.catalog.find(candidate => candidate.id === modelId)
+        if (entry === undefined) return false
+        return !isEacEntry(entry) && !isKiloEntry(entry) && !isAggregateEntry(entry)
+      } catch { return false }
+    }
     const off = ctx.on('session/event', (_session, event) => {
       if (event?.type !== 'model/selection') return
       const selection = event.data
       if (selection?.provider !== 'our-free-model') return
-      if (typeof selection.model !== 'string' || !selection.model.endsWith('-free')) return
+      if (typeof selection.model !== 'string' || !wantsBridge(selection.model)) return
       /* 延后一个 tick：事件回调里不做重活，任何异常都不许外溢到宿主。 */
       setTimeout(() => {
         try { void ensureService({ autostart: true }).catch(() => {}) } catch { /* 预热失败不影响 DSH */ }
