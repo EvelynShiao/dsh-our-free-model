@@ -58,6 +58,31 @@ export async function serviceInfo() {
       userAgent: process.env.OPENCODE_SERVER_UA ?? DEFAULT_UA,
     }
   }
+  const info = await probeServiceInfo()
+  if (info !== null) return info
+  /**
+  * ## 自动拉起 + 等待就绪（2026-10-20 修「一调用就闪退」）
+  *
+  * 用户原话：「模型页一选择到就要自动拉起」「就算没拉起也该让我等待拉起
+  * 而不是闪退」。此前本函数只读不拉——service.json 过期/服务死后
+  * 直接 null ⇒ fetch failed ⇒ 一选就闪退。
+  *
+  * 现在复用 opencode-bridge 的 ensureService（幂等、并发只起一次、
+  * 最多等 10 秒端口就绪）。拉起后重读（invalidateService 已在拉起路径
+  * 内部清缓存），拿到新 url 再返回。拉不起来才退 null。
+  */
+  try {
+    const { ensureService } = await import('./opencode-bridge.js')
+    const svc = await ensureService({ autostart: true })
+    if (svc !== null) {
+      return { url: svc.url, password: svc.password, userAgent: DEFAULT_UA }
+    }
+  } catch { /* bridge 不在（打包裁剪）就保持 null——调用方走直连回退 */ }
+  return null
+}
+
+/** 只读探测（原 serviceInfo 主体，不含拉起）。 */
+async function probeServiceInfo() {
   if (cached !== null && Date.now() - cachedAt < SERVICE_TTL_MS) return cached
   /* 手工/跨机口子：$DSH_HOME/our-free-model/opencode-bridge.json = {url, password}
      —— 手机等没有本地 opencode 服务的设备，把 PC 上局域网暴露的 serve 地址填进来
@@ -84,6 +109,15 @@ export async function serviceInfo() {
   }
   cached = null
   return null
+}
+
+/** 缓存的服务信息是否还能真连上（端口活着）——读得到但服务死了时立即失效。 */
+async function serviceAlive(svc) {
+  if (svc === null) return false
+  const { ensureService } = await import('./opencode-bridge.js').catch(() => ({ ensureService: null }))
+  if (ensureService === null) return true /* bridge 不在就只信缓存 */
+  const live = await ensureService({ autostart: false })
+  return live !== null && live.url === svc.url
 }
 
 /** 让服务信息失活（服务重启后强制重读）。 */

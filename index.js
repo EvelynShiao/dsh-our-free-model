@@ -1707,6 +1707,16 @@ function sanitizeSettings(patch, current) {
     const hours = Number(next.updateCheckHours)
     next.updateCheckHours = Number.isFinite(hours) && hours >= 0 ? Math.trunc(hours) : (Number(current.updateCheckHours) || 6)
   }
+  /**
+  * hiddenModels（2026-10-20 用户点名「每个模型加个是否显示在模型选择页的按钮」）：
+  * 字符串数组——只认非空字符串；非法输入整体丢弃回落现值。
+  * listModels 据此把隐藏模型从选择页滤掉（resolveModel 不过滤——旧会话照用）。
+  */
+  if (next.hiddenModels !== undefined) {
+    next.hiddenModels = Array.isArray(next.hiddenModels)
+      ? next.hiddenModels.filter(id => typeof id === 'string' && id.length > 0 && id.length < 200).slice(0, 500)
+      : (Array.isArray(current.hiddenModels) ? current.hiddenModels : [])
+  }
   return next
 }
 
@@ -1939,7 +1949,7 @@ function createApiRoutes(deps) {
       if (method === 'POST' && routePath === '/settings') {
         const patch = await readJson(req)
         const current = deps.settings.get()
-        const next = sanitizeSettings({ ...current, ...pick(patch, ['enabled', 'exposeRegionModels', 'probeIntervalMinutes', 'defaultMaxTokens', 'announcementAck', 'feedUrl', 'feedPollMinutes', 'notifyOs', 'updateCheckHours', 'autoReloadWatch', 'bridge']) }, current)
+        const next = sanitizeSettings({ ...current, ...pick(patch, ['enabled', 'exposeRegionModels', 'probeIntervalMinutes', 'defaultMaxTokens', 'announcementAck', 'feedUrl', 'feedPollMinutes', 'notifyOs', 'updateCheckHours', 'autoReloadWatch', 'bridge', 'hiddenModels']) }, current)
         if (patch.forward !== undefined) {
           const forward = { ...(current.forward ?? {}), ...pick(patch.forward, ['enabled', 'host', 'port']) }
           // The listener spends this machine's lane, and a routable bind address

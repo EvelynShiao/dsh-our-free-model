@@ -70,8 +70,12 @@ export function readService() {
   for (const p of serviceCandidates()) {
     try {
       const j = JSON.parse(fs.readFileSync(p, 'utf8'));
+      /* 2026-10-20 修「一调用就闪退」：新版 opencode serve 不再写带 url 的 service.json（固定 127.0.0.1:4096，只留 password）——有 password 没 url 时补默认 url。 */
       if (typeof j?.url === 'string' && j.url.length > 0) {
         return { url: j.url.replace(/\/+$/, ''), password: String(j?.password ?? '') };
+      }
+      if (typeof j?.password === 'string' && j.password.length > 0) {
+        return { url: 'http://127.0.0.1:4096', password: j.password };
       }
     } catch { /* 换下一个候选 */ }
   }

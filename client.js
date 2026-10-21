@@ -2652,15 +2652,21 @@ window.__ModuleLoader__.load({
 
     // ── model roster ──────────────────────────────────────────────────────────
     function ModelCard(props) {
-      const { model: m, t, onBench, bench, locked, eacLogin } = props
+      const { model: m, t, onBench, bench, locked, eacLogin, hidden, onToggleHidden } = props
       const stateKey = `state.${m.availability}`
       const dim = m.availability !== 'available'
       const rung = (m.budgets ?? []).find(row => row.isDefault === true)
-      return h('article', { className: 'ofm_card' + (dim ? ' dim' : '') },
+      return h('article', { className: 'ofm_card' + (dim ? ' dim' : '') + (hidden === true ? ' ofm_card_hidden' : '') },
         h('div', { className: 'ofm_cardhead' },
           m.channel === 'eac' ? h('span', { className: 'ofm_chantag', title: t('tag.eacChannel') }, 'EAC') : null,
           m.channel === 'eac' && locked === true ? h('span', { className: 'ofm_chantag', title: t('eac.lockedTitle') }, '🔒') : null,
           m.channel === 'kilo' ? h('span', { className: 'ofm_chantag', title: t('tag.kiloChannel') }, 'Kilo') : null,
+          /* 显隐按钮（2026-10-20 用户点名）：切换「是否显示在模型选择页」——隐藏后 listModels 滤掉，旧会话照用。 */
+          h('span', {
+            className: 'ofm_chantag', style: { cursor: 'pointer' },
+            title: hidden === true ? '已隐藏（不在模型选择页显示；点击恢复显示）' : '显示在模型选择页中（点击隐藏）',
+            onClick: onToggleHidden,
+          }, hidden === true ? '👁‍🗨已隐藏' : '👁显示中'),
           h('span', { className: 'ofm_cardname', title: m.name }, m.name),
           h('span', { className: 'ofm_badge ' + m.availability }, t(stateKey))),
         h('div', { className: 'ofm_id', title: m.id }, m.id),
@@ -2704,6 +2710,20 @@ window.__ModuleLoader__.load({
       // 只有拿到过明确判定（网关答过 /eac/status）且未授权时才上锁：状态未知
       // 不该显示一把凭空的锁，网关不可达时本地记录仍算已授权。
       const locked = auth !== undefined && auth.available === true && auth.authorized !== true
+      // 显隐（2026-10-20 用户点名「每个模型加个是否显示在模型选择页的按钮」）：
+      // hiddenModels 存设置里（后端 listModels 过滤），resolveModel 不过滤（旧会话照用）。
+      const [busyHide, setBusyHide] = useState(false)
+      const hiddenSet = new Set(Array.isArray(summary.settings?.hiddenModels) ? summary.settings.hiddenModels : [])
+      const toggleHidden = async id => {
+        if (busyHide) return
+        setBusyHide(true)
+        try {
+          const next = hiddenSet.has(id) ? [...hiddenSet].filter(x => x !== id) : [...hiddenSet, id]
+          await post('/settings', { hiddenModels: next })
+          window.location.reload()
+        } catch (e) { /* 失败静默——设置页顶层 note 由 onApply 展示 */ }
+        finally { setBusyHide(false) }
+      }
       const group = (title, list, hint) => list.length === 0 ? null
         : h('div', { className: 'ofm_sec', style: { gap: 8 } },
           h('div', { className: 'ofm_row' }, h('span', { className: 'ofm_sec_title', style: { fontSize: 12.5 } }, title),
@@ -2711,6 +2731,8 @@ window.__ModuleLoader__.load({
           h('div', { className: 'ofm_grid' }, list.map(m => h(ModelCard, {
             key: m.id, model: m, t, onBench, locked: m.channel === 'eac' && locked, eacLogin,
             bench: { running: benches[m.id]?.running === true, ...benches[m.id]?.result === undefined ? {} : { result: benches[m.id].result } },
+            hidden: hiddenSet.has(m.id),
+            onToggleHidden: () => void toggleHidden(m.id),
           }))))
       // The lane closed at the gate is the one "no EAC models" case the page can
       // explain without a log (issue #60): on a host the kernel gave no profile,

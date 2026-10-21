@@ -106,12 +106,15 @@ export class FreeModelAdapter {
     return FALLBACK_IMAGE_PRICING
   }
 
-  /** Models this route advertises right now. */
+  /** Models this route advertises right now.
+   * hiddenModels（2026-10-20）：设置里勾掉的模型不进选择页——
+   * resolveModel 不过滤，旧会话里已选中的隐藏模型照常能跑。 */
   async listModels(provider) {
     const state = this.deps.state()
     const ids = new Set(state.membership[provider] ?? [])
+    const hidden = new Set(Array.isArray(state.settings.hiddenModels) ? state.settings.hiddenModels : [])
     return state.catalog
-      .filter(entry => ids.has(entry.id))
+      .filter(entry => ids.has(entry.id) && !hidden.has(entry.id))
       .map(entry => ({
         provider,
         id: entry.id,
