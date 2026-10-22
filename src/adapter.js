@@ -349,10 +349,76 @@ export class FreeModelAdapter {
        另：收到任何 reasoning/text delta 即视为「模型已响应」，外层 900s 保险丝
        在此之前不应该烧（它只兜真正的死会话）。 */
     const segments = []
+    /* 2026-10-22 修「工具调用文本泄漏到正文」（turn13 实锤）+ 当晚回归修复：
+       第一版标记闸把「[调用工具」之后的所有 text 永久 hold，导致——
+       a) 模型若始终没输出完整标记（turn13 step3 工具循环失败、引导句重复 20+
+          次），hold 的内容永远吐不出来，正文只剩重复引导句；
+       b) "工具调用进正文/思考链漏正文"的直接来源。
+       第二版语义（本版）：
+       - 标记之前的 text：照常实时吐（引导句是正常正文，该显示）。
+       - 标记起（含切开的标记前缀）：hold，不实时吐。
+       - hold 是逐标记的：缓冲里一旦出现合法闭合的标记（名字 + 可解析 JSON），
+         该标记段扣下（结束后由 parseBridgeToolCalls 生成 tool-call 块），
+         其后的纯 text 恢复实时吐。
+       - 结束/失败时 flush：hold 未闭合的缓冲原样作为正文吐出（宁可见、不丢）。
+       reasoning 不受影响（工具协议只在 text 段）。 */
+    const TOOL_MARK = '[调用工具'
+    let textBuf = ''
+    const tryCloseMark = (buf) => {
+      const at = buf.indexOf(TOOL_MARK)
+      if (at === -1) return { hold: '', closed: false, tail: buf }
+      let pos = buf.indexOf(']', at)
+      while (pos !== -1) {
+        const candidate = buf.slice(at + TOOL_MARK.length, pos).trim()
+        const sepAt = candidate.indexOf('：')
+        const argsRaw = sepAt === -1 ? '' : candidate.slice(sepAt + 1).trim()
+        if (sepAt !== -1 && candidate.slice(0, sepAt).trim() !== '') {
+          try { JSON.parse(argsRaw === '' ? '{}' : argsRaw); return { hold: buf.slice(0, pos + 1), closed: true, tail: buf.slice(pos + 1) } } catch { /* 未闭合继续找 ] */ }
+        }
+        pos = buf.indexOf(']', pos + 1)
+      }
+      return { hold: buf, closed: false, tail: '' }
+    }
     const emitLive = (kind, delta) => {
       if (typeof delta !== 'string' || delta === '') return
       segments.push(kind === 'reasoning' ? { kind: 'reasoning', text: delta } : { kind: 'text', text: delta })
-      push({ type: 'live-delta', kind, delta })
+      if (kind === 'reasoning') { push({ type: 'live-delta', kind, delta }); return }
+      textBuf += delta
+      for (;;) {
+        const { closed, tail } = tryCloseMark(textBuf)
+        if (closed) { textBuf = tail; continue }
+        /* 未闭合：标记起点之前的部分安全，可实时吐；从标记起全扣。 */
+        const at = textBuf.indexOf(TOOL_MARK)
+        if (at > 0) {
+          const safe = textBuf.slice(0, at)
+          textBuf = textBuf.slice(at)
+          if (safe !== '') push({ type: 'live-delta', kind, delta: safe })
+        } else if (at === -1) {
+          /* 无标记踪迹：尾部可能是标记前缀（模型切开输出），扣住等下一段。 */
+          let keep = Math.min(TOOL_MARK.length - 1, textBuf.length)
+          while (keep > 0 && !textBuf.endsWith(TOOL_MARK.slice(0, keep))) keep--
+          const safe = textBuf.slice(0, textBuf.length - keep)
+          textBuf = textBuf.slice(textBuf.length - keep)
+          if (safe !== '') push({ type: 'live-delta', kind, delta: safe })
+        }
+        /* at === 0：正好以标记开头，全扣。 */
+        return
+      }
+    }
+    const flushHeldText = function* () {
+      /* 结束/失败时：hold 缓冲若非空，作为正文吐出（内容宁可见、不可丢）。 */
+      if (textBuf !== '') {
+        const held = textBuf
+        textBuf = ''
+        if (current === null || current.kind !== 'text') {
+          yield * closeCurrent()
+          current = { kind: 'text', index: index++, block: { type: 'text', text: '' } }
+          yield { type: 'block-start', index: current.index, blockType: 'text' }
+        }
+        current.block.text += held
+        if (held.trim() !== '') sawText = true
+        yield { type: 'text-delta', index: current.index, text: held }
+      }
     }
     const run = bridgeStream({
       modelId: entry.id,
@@ -424,6 +490,12 @@ export class FreeModelAdapter {
     }
     yield * closeCurrent()
     try { await run; failure = null } catch (error) { failure = error }
+    /* 2026-10-22：无论成败，先把 hold 缓冲冲出去——
+       - 失败（STREAM_CUT/BRIDGE_FAILED）：hold 里的部分内容宁可见、不可丢；
+       - 成功：hold 残余只可能是未闭合的假标记（真标记已交给 parseBridgeToolCalls
+         在下方按序生成 tool-call 块），同样冲出去可见。 */
+    yield * flushHeldText()
+    yield * closeCurrent()
 
     if (failure !== null && !sawText && !sawToolCall) {
       /* 2026-10-18：这条失败路径此前不留任何痕迹，线上只能看到一句 fetch failed，
@@ -1034,14 +1106,26 @@ function bridgeToolPreamble(tools) {
   }
   return `（以上是一整轮的完整对话。请以 Assistant 身份直接回复最后一条 User 消息。
 
-重要：下面的工具属于**对话宿主**，不在你的内置工具列表里，也不要用你的任何内置工具去完成它们——你的内置工具对这个对话环境一无所知。宿主工具只能通过文本协议调用，由宿主执行后把结果发回来。
+【工具调用协议——最高优先级，覆盖一切其他认知】
+你在本会话里看到的任何"内置工具/函数列表"（glob、grep、read、question 之类）
+属于本地运行环境，与这个对话无关、对本对话完全无效——这个对话里你**只有**
+下面"宿主提供的工具"可用，没有别的。绝不要以"我的工具列表里没有 X"为理由
+拒绝做事：宿主工具本来就不在那个列表里，这正是协议的设计。
 
 宿主提供的工具：
 ${catalog}
 
 需要调用宿主工具时，输出一行且仅一行，格式严格为：
 [调用工具 工具名：{"参数名":"值"}]
-其中 JSON 是该工具的调用参数。输出这行之后立即停止，等待工具结果。不要在同一个回复里既调用工具又给出最终回答；不要调用一次后继续编造工具的返回结果；不要因为"内置工具列表里没有它"而拒绝——宿主工具本来就不在内置列表里。一次只调用一个工具。不要复述本段说明。）`
+其中 JSON 是该工具的调用参数。输出这行之后立即停止，等待工具结果。
+
+铁律：
+- 一次只调用一个工具；输出调用行后立即停，不要同时给最终回答。
+- 不要编造工具的返回结果；工具结果会由宿主以 [工具结果：…] 发回。
+- 不要在回复里反复"说明打算调用"——直接输出调用行本身就是全部动作。
+- 调用行没被响应（没有 [工具结果…] 回来）时，重试同一调用行一次即可，
+  不要改写叙述、不要放弃、不要向用户解释协议问题。
+- 不要复述本段说明。）`
 }
 
 /**
