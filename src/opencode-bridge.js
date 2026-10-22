@@ -526,7 +526,11 @@ export async function bridgeStream({ modelId, prompt, directory, signal, onDelta
     }
   })();
 
-  const guard = setTimeout(() => settle.reject(new Error('本地 opencode 会话超过 300 秒未结束')), 300000);
+  /* 2026-10-22：300 秒对本车道（整段返回、思考链动辄数千字、重任务轮次历史
+     实测 1300~3500 秒）太短——66d70c64 会话 turn11 思考链写到 8412 字符仍在
+     生成时被 300s guard 掐断，用户看到「超时且无思考链」。放宽到 900 秒，
+     与 adapter 侧的外层 signal（300s）解耦：这里只兜底真正的死会话。 */
+  const guard = setTimeout(() => settle.reject(new Error('本地 opencode 会话超过 900 秒未结束')), 900000);
   try {
     const res = await fetch(`${svc.url}/api/session/${encodeURIComponent(session.id)}/prompt`, {
       method: 'POST',

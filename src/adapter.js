@@ -325,9 +325,11 @@ export class FreeModelAdapter {
       return
     }
     const prompt = renderBridgePrompt(options.messages, entry, options.tools)
+    /* 2026-10-22：与 bridgeStream 的 900s guard 同步放宽（见 opencode-bridge.js 注释）。
+       实测重任务轮次 1300~3500 秒，300s 会在上游仍在正常生成时把整轮掐死。 */
     const signal = options.signal === undefined
-      ? AbortSignal.timeout(300000)
-      : (typeof AbortSignal.any === 'function' ? AbortSignal.any([options.signal, AbortSignal.timeout(300000)]) : options.signal)
+      ? AbortSignal.timeout(900000)
+      : (typeof AbortSignal.any === 'function' ? AbortSignal.any([options.signal, AbortSignal.timeout(900000)]) : options.signal)
 
     /* 事件 → 队列 → generator：上游是一次性整段返回，所以先攒整段、
        解析出工具调用后再按块吐（2026-10-15 工具协议改造）。 */
