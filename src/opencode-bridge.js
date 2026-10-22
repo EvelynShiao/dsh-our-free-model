@@ -360,17 +360,19 @@ export function ensurePipeAgent() {
  */
 export async function createSession(svc, modelId, directory, signal) {
   ensurePipeAgent()
-  const res = await fetch(`${svc.url}/api/session`, {
+  let res = await fetch(`${svc.url}/api/session`, {
     method: 'POST',
     headers: headers(svc),
     body: JSON.stringify({ agent: BRIDGE_AGENT, location: { directory }, model: { providerID: 'opencode', id: modelId } }),
     signal: signal ?? AbortSignal.timeout(15000),
   });
-  let doc = await parseJsonResponse(res, 'opencode 建会话失败');
-  let id = doc?.data?.id;
-  /* agent 刚写入时服务端注册表可能没热好（实测"Agent not found"一次）：
-     退回 build 重试一次，管道保命。 */
-  if (res.status === 503 && typeof doc?.message === 'string' && doc.message.includes('Agent not found')) {
+  let doc = null;
+  /* 2026-10-22 真机实锤：新版 opencode 服务对 mute2 的 agent 定义直接回 HTTP 500
+     （空 body），不再像旧版那样只在注册表未热时报 503 Agent not found。tools 里
+     "execute"/"bash" 这些名字在新版工具集中已不存在，服务端校验炸在配置装载。
+     处置：任何非 2xx 都回退内置 build agent（实测 200），管道保命；mute2 语义
+     （不带危险工具）由 DSH 侧提示词协议保证，prompt 本来就不给模型工具说明。 */
+  if (!res.ok) {
     const retry = await fetch(`${svc.url}/api/session`, {
       method: 'POST',
       headers: headers(svc),
@@ -378,8 +380,10 @@ export async function createSession(svc, modelId, directory, signal) {
       signal: signal ?? AbortSignal.timeout(15000),
     });
     doc = await parseJsonResponse(retry, 'opencode 建会话失败');
-    id = doc?.data?.id;
+  } else {
+    doc = await parseJsonResponse(res, 'opencode 建会话失败');
   }
+  const id = doc?.data?.id;
   if (typeof id !== 'string' || !id.startsWith('ses_')) throw new Error('opencode 建会话没有返回会话 id');
   return { id, projectID: doc?.data?.projectID ?? '' };
 }
@@ -440,7 +444,16 @@ export function assertFreeModel(modelId) {
 export async function bridgeStream({ modelId, prompt, directory, signal, onDelta, onReasoning, onUsage, autostart = bridgeConfig.autostart }) {
   const id = assertFreeModel(modelId)
   let svc = await ensureService({ autostart })
-  if (svc === null) throw new Error(BRIDGE_HINT);
+  /* 2026-10-22 真机实锤的补丁：idleStopSeconds=60 时，「切模型→打字→发送」常常超过
+     60 秒，看门狗把服务收走，第一发 fetch failed（66d70c64 会话 18:43:28 复现：
+     selection 预热两次都正确触发、也都被 60s 收走）。这里不再把「服务不在」当错误
+     抛出，而是当场拉起再走——冷启动实测约 0.5s，代价是这轮慢半秒，换来永远不因
+     服务缺位而失败。上游本身故障（拉起后仍拒绝）不受影响，照常走失败路径。 */
+  if (svc === null) {
+    if (signal?.aborted === true) throw new Error(BRIDGE_HINT);
+    svc = await ensureService({ autostart: true });
+    if (svc === null) throw new Error(BRIDGE_HINT);
+  }
   noteBridgeUse()
   const dir = directory ?? process.env.DSH_HOME ?? homedir();
   let session;
@@ -541,8 +554,13 @@ export async function bridgeStream({ modelId, prompt, directory, signal, onDelta
  */
 export async function bridgeGenerate({ modelId, prompt, directory, signal, autostart = bridgeConfig.autostart }) {
   const id = assertFreeModel(modelId);
-  const svc = await ensureService({ autostart });
-  if (svc === null) throw new Error(BRIDGE_HINT);
+  let svc = await ensureService({ autostart });
+  /* 与 bridgeStream 同源的洞：服务不在时不再直接抛错，当场拉起（见 2026-10-22 补丁注释）。 */
+  if (svc === null) {
+    if (signal?.aborted === true) throw new Error(BRIDGE_HINT);
+    svc = await ensureService({ autostart: true });
+    if (svc === null) throw new Error(BRIDGE_HINT);
+  }
   noteBridgeUse()
   const dir = directory ?? process.env.DSH_HOME ?? homedir();
   const session = await createSession(svc, id, dir, signal);
