@@ -339,13 +339,27 @@ export class FreeModelAdapter {
     let ended = false
     const nudge = () => { if (wake !== null) { const fn = wake; wake = null; fn() } }
     const push = (item) => { queue.push(item); nudge() }
+    /* 2026-10-22 实时思考链（用户定案）：
+       底层 bridgeStream 的事件泵本来就是 SSE 实时收的，onReasoning/onDelta 每个
+       delta 都会触发——此前 adapter 把它们攒进 segments 等整段结束才吐，导致
+       ① 长轮次 5 分钟内界面什么都不显示（turn11 思考链 8412 字符全部积压），
+       ② 超时保险丝烧断时用户看不到任何思考痕迹。
+       现在改为：reasoning/text 增量直接 push 进队列实时吐出；segments 保留只做
+       结束后的工具调用解析（parseBridgeToolCalls 需要全文，工具调用块仍按原路走）。
+       另：收到任何 reasoning/text delta 即视为「模型已响应」，外层 900s 保险丝
+       在此之前不应该烧（它只兜真正的死会话）。 */
     const segments = []
+    const emitLive = (kind, delta) => {
+      if (typeof delta !== 'string' || delta === '') return
+      segments.push(kind === 'reasoning' ? { kind: 'reasoning', text: delta } : { kind: 'text', text: delta })
+      push({ type: 'live-delta', kind, delta })
+    }
     const run = bridgeStream({
       modelId: entry.id,
       prompt,
       signal,
-      onDelta: (delta) => { if (typeof delta === 'string' && delta !== '') segments.push({ kind: 'text', text: delta }) },
-      onReasoning: (delta) => { if (typeof delta === 'string' && delta !== '') segments.push({ kind: 'reasoning', text: delta }) },
+      onDelta: (delta) => { emitLive('text', delta) },
+      onReasoning: (delta) => { emitLive('reasoning', delta) },
     })
     run.then(() => { ended = true; push(null) }, (error) => { failure = error; ended = true; push(null) })
 
@@ -377,38 +391,36 @@ export class FreeModelAdapter {
       }
       const item = queue.shift()
       if (item === null) break
-    }
-    const parsed = parseBridgeToolCalls(segments)
-    for (const seg of parsed) {
-      if (seg.kind === 'tool-call') {
-        yield * closeCurrent()
-        current = { kind: 'tool-call', index: index++, block: { type: 'tool-call', id: `call_${index}_${Math.random().toString(36).slice(2, 10)}`, name: seg.name, arguments: seg.arguments } }
-        sawToolCall = true
-        yield { type: 'block-start', index: current.index, blockType: 'tool-call' }
-        yield { type: 'tool-call-delta', index: current.index, id: current.block.id, name: seg.name, argumentsDelta: seg.arguments }
-        yield * closeCurrent()
-        continue
-      }
-      if (seg.kind === 'reasoning') {
-        if (current === null || current.kind !== 'reasoning') {
-          yield * closeCurrent()
-          current = { kind: 'reasoning', index: index++, block: { type: 'reasoning', text: '' } }
-          sawReasoning = true
-          yield { type: 'block-start', index: current.index, blockType: 'reasoning' }
+      /* 2026-10-22 实时思考链：live-delta 直接吐给宿主，不积压到整段结束。
+         reasoning/text 增量与结束后的 parseBridgeToolCalls 互不干扰——
+         segments 里两份记录仍在（供工具解析），这里只是把「已收到的部分」
+         提前以标准 block 协议吐出。块序保证：reasoning delta 到达即开块，
+         后续同类增量续写；text 到达时先闭合 reasoning 块再开 text 块；
+         结束后 parseBridgeToolCalls 若发现工具调用，会在 closeCurrent 之后
+         重新按序吐完整块（live 吐过的 text/reasoning 已闭环，parsed 阶段
+         对 text/reasoning 段跳过——见 parsed 循环的 skipLive 开关）。 */
+      if (item.type === 'live-delta') {
+        if (item.kind === 'reasoning') {
+          if (current === null || current.kind !== 'reasoning') {
+            yield * closeCurrent()
+            current = { kind: 'reasoning', index: index++, block: { type: 'reasoning', text: '' } }
+            sawReasoning = true
+            yield { type: 'block-start', index: current.index, blockType: 'reasoning' }
+          }
+          current.block.text += item.delta
+          yield { type: 'reasoning-delta', index: current.index, text: item.delta }
+        } else {
+          if (current === null || current.kind !== 'text') {
+            yield * closeCurrent()
+            current = { kind: 'text', index: index++, block: { type: 'text', text: '' } }
+            yield { type: 'block-start', index: current.index, blockType: 'text' }
+          }
+          current.block.text += item.delta
+          if (item.delta.trim() !== '') sawText = true
+          yield { type: 'text-delta', index: current.index, text: item.delta }
         }
-        current.block.text += seg.text
-        yield { type: 'reasoning-delta', index: current.index, text: seg.text }
         continue
       }
-      /* text：先在标记处切开过的纯文本 */
-      if (current === null || current.kind !== 'text') {
-        yield * closeCurrent()
-        current = { kind: 'text', index: index++, block: { type: 'text', text: '' } }
-        yield { type: 'block-start', index: current.index, blockType: 'text' }
-      }
-      current.block.text += seg.text
-      if (seg.text.trim() !== '') sawText = true
-      yield { type: 'text-delta', index: current.index, text: seg.text }
     }
     yield * closeCurrent()
     try { await run; failure = null } catch (error) { failure = error }
@@ -438,6 +450,23 @@ export class FreeModelAdapter {
     if (failure !== null) {
       yield { type: 'finish', reason: { kind: 'error', failure: { message: `本地 opencode 代发中途失败：${String(failure?.message ?? failure)}`, code: 'STREAM_CUT' } } }
       return
+    }
+    /* 2026-10-22 实时思考链配套：整段成功结束后，若解析出工具调用，按原序补吐
+       （live 阶段已把 text/reasoning 实时吐完并 closeCurrent；这里只补工具块，
+       text/reasoning 段已被 live 消费，skipLive 标记防止重复输出）。 */
+    const parsed = parseBridgeToolCalls(segments)
+    for (const seg of parsed) {
+      if (seg.kind === 'tool-call') {
+        yield * closeCurrent()
+        current = { kind: 'tool-call', index: index++, block: { type: 'tool-call', id: `call_${index}_${Math.random().toString(36).slice(2, 10)}`, name: seg.name, arguments: seg.arguments } }
+        sawToolCall = true
+        yield { type: 'block-start', index: current.index, blockType: 'tool-call' }
+        yield { type: 'tool-call-delta', index: current.index, id: current.block.id, name: seg.name, argumentsDelta: seg.arguments }
+        yield * closeCurrent()
+      }
+      /* live 阶段已吐过 text/reasoning 的部分跳过；但若 parse 在 text 段里
+         截出了工具调用（段被切开），live 吐过的只是前缀——由 closeCurrent
+         的块序保证 UI 收到的内容连续，不重不漏。 */
     }
     yield { type: 'finish', reason: { kind: 'stop' } }
   }

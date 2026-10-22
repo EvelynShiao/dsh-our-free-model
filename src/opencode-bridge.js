@@ -507,9 +507,11 @@ export async function bridgeStream({ modelId, prompt, directory, signal, onDelta
           if (data.sessionID !== session.id) continue;
           if (event.type === 'session.text.delta' && typeof data.delta === 'string') {
             full += data.delta;
+            resetGuard();
             onDelta?.(data.delta, full);
           } else if (event.type === 'session.reasoning.delta' && typeof data.delta === 'string') {
             reasoning += data.delta;
+            resetGuard();
             onReasoning?.(data.delta, reasoning);
           } else if (event.type === 'session.step.ended') {
             if (data.tokens !== undefined) onUsage?.(data.tokens);
@@ -526,11 +528,12 @@ export async function bridgeStream({ modelId, prompt, directory, signal, onDelta
     }
   })();
 
-  /* 2026-10-22：300 秒对本车道（整段返回、思考链动辄数千字、重任务轮次历史
-     实测 1300~3500 秒）太短——66d70c64 会话 turn11 思考链写到 8412 字符仍在
-     生成时被 300s guard 掐断，用户看到「超时且无思考链」。放宽到 900 秒，
-     与 adapter 侧的外层 signal（300s）解耦：这里只兜底真正的死会话。 */
-  const guard = setTimeout(() => settle.reject(new Error('本地 opencode 会话超过 900 秒未结束')), 900000);
+  /* 2026-10-22 实时思考链配套：保险丝改为「无输出」计时——收到任何 delta 就重置。
+     900 秒静默才判死；持续吐思考链的重轮次（实测 1300~3500s）不再被误杀。
+     （用户定案：有了思考链就该算模型响应，超时只管真正的死会话。） */
+  let guard = setTimeout(onGuardFire, 900000);
+  function onGuardFire() { settle.reject(new Error('本地 opencode 会话超过 900 秒无输出')) }
+  const resetGuard = () => { clearTimeout(guard); guard = setTimeout(onGuardFire, 900000); };
   try {
     const res = await fetch(`${svc.url}/api/session/${encodeURIComponent(session.id)}/prompt`, {
       method: 'POST',
