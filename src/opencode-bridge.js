@@ -478,7 +478,13 @@ export async function bridgeStream({ modelId, prompt, directory, signal, onDelta
   let full = '';
   let reasoning = '';
   let settle;
-  const finished = new Promise((resolve, reject) => { settle = { resolve, reject }; });
+  let settled = false;
+  const finished = new Promise((resolve, reject) => {
+    settle = {
+      resolve: (value) => { if (!settled) { settled = true; resolve(value); } },
+      reject: (error) => { if (!settled) { settled = true; reject(error); } },
+    };
+  });
 
   /* 事件订阅（失败即让本次调用失败，绝不静默卡住） */
   const sub = await fetch(`${svc.url}/api/event`, {
@@ -488,12 +494,49 @@ export async function bridgeStream({ modelId, prompt, directory, signal, onDelta
   if (!sub.ok || sub.body === null) throw new Error(`opencode 事件流打不开 HTTP ${sub.status}`);
   const reader = sub.body.getReader();
   const decoder = new TextDecoder();
+  /* 2026-10-23 修「300s 处 terminated」（66d70c64 turn14 实锤）：上游生成中会有
+     1~2 分钟"闷头想"的停顿（reasoning 146 段后有 102s 空洞实测），opencode 服务的
+     SSE 转发层在流静置约 300s 时把连接断掉（undici 报 terminated）——不是超时也
+     不是上游失败，纯粹连接层断流。会话本体在服务端是持久的，处置：订阅断开后
+     自动重连 /api/event 续听同一会话，最多 5 次、每次间隔 2s；重连期间会话若已
+     执行完成，靠轮询 /api/session/{id} 读最终文本兜底。 */
+  let resubCount = 0;
+  const resubscribe = async () => {
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      if (settled) return null;
+      try {
+        const retrySub = await fetch(`${svc.url}/api/event`, { headers: { ...headers(svc), Accept: 'text/event-stream' }, signal: ac.signal });
+        if (retrySub.ok && retrySub.body !== null) return retrySub;
+      } catch { /* 继续退避 */ }
+    }
+    return null;
+  };
   void (async () => {
     let buf = '';
+    let activeReader = reader;
     try {
       for (;;) {
-        const { value, done } = await reader.read();
-        if (done === true) break;
+        const { value, done } = await activeReader.read();
+        if (done === true) {
+          /* 连接被掐（300s idle 断流）：先查会话是否其实已完成，再重连续听。 */
+          if (settled) return;
+          let finished = false;
+          try {
+            const info = await fetch(`${svc.url}/api/session/${encodeURIComponent(session.id)}`, { headers: headers(svc), signal: ac.signal });
+            if (info.ok) {
+              const doc = await info.json().catch(() => null);
+              finished = doc?.data?.time?.updated !== undefined && doc?.data?.time?.ended !== undefined;
+            }
+          } catch { /* 查询失败继续重连 */ }
+          if (!finished && resubCount < 5) {
+            resubCount += 1;
+            const reSub = await resubscribe();
+            if (reSub !== null) { activeReader = reSub.body.getReader(); continue }
+          }
+          if (!settled) settle.resolve(full);
+          return;
+        }
         buf += decoder.decode(value, { stream: true });
         const lines = buf.split('\n');
         buf = lines.pop() ?? '';
