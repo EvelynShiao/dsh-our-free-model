@@ -139,7 +139,7 @@ export function createModelRuntime({
   let catalogRefreshForced = false
   let catalogRefreshProbed = false
   async function refreshCatalog(opts) {
-    const { probe = true, force = false } = opts ?? {}
+    const { probe = true, force = false, probeForceLane } = opts ?? {}
     if (disposed) return catalog
     while (catalogRefresh !== null) {
       const shared = catalogRefresh
@@ -148,7 +148,7 @@ export function createModelRuntime({
       const value = await shared
       if (disposed || ((!force || sharedForced) && (!probe || sharedProbed))) return value
     }
-    const run = refreshCatalogOnce({ probe, force })
+    const run = refreshCatalogOnce({ probe, force, probeForceLane })
     catalogRefresh = run
     catalogRefreshForced = force
     catalogRefreshProbed = probe
@@ -159,7 +159,7 @@ export function createModelRuntime({
     }
   }
 
-  async function refreshCatalogOnce({ probe, force }) {
+  async function refreshCatalogOnce({ probe, force, probeForceLane }) {
     let ids = []
     try {
       ids = parseListing(await fetchListing())
@@ -251,7 +251,7 @@ export function createModelRuntime({
   let probeRound = null
   let probeThrottleStreak = 0
   let probeBackoffUntil = 0
-  async function runProbeRound() {
+  async function runProbeRound(opts = {}) {
     // The absorbed channels get no per-model probes: their verdicts would be
     // spent against a different gateway than the one that serves them, and a
     // roster the listing named is advertised as-is (its health is the listing
@@ -261,7 +261,16 @@ export function createModelRuntime({
     // (whether a key is configured). A combo is excluded because it has no
     // endpoint of its own: probing one would send the chain's own id to the free
     // lane as a model name, spending quota to collect a verdict about nothing.
-    const probeable = catalog.filter(entry => !isEacEntry(entry) && !isKiloEntry(entry) && !isAggregateEntry(entry) && !isComboEntry(entry))
+    /* 2026-10-23 探针手动控制（用户点名）：probeSkipFreeLane=true 时自动探测
+       跳过 free 车道全部模型——free 车道的探针是真实生成请求（bridgeGenerate
+       'ping' 或上游 ping 流），15 分钟一轮×N 模型把 IP 匿名额度烧穿是主因。
+       EAC/kilo 探针（登录态/无凭证池）不受此开关影响；「立即探测」手动路径
+       传 probeForceLane:'free' 仍可全量探。catalog 刷新照常，被跳过的模型
+       徽章维持上次判定或 unknown。 */
+    const skipFree = settings.get().probeSkipFreeLane === true && opts?.probeForceLane !== 'free'
+    const probeable = skipFree
+      ? []
+      : catalog.filter(entry => !isEacEntry(entry) && !isKiloEntry(entry) && !isAggregateEntry(entry) && !isComboEntry(entry))
     const results = await probeCatalog(probeable, { attributionUserAgent, signal: lifetime.signal }, (id, result) => {
       if (disposed) return
       availability.edit(value => ({
@@ -295,10 +304,10 @@ export function createModelRuntime({
     emitTopology()
     return results
   }
-  async function refreshAvailability(force = false) {
+  async function refreshAvailability(force = false, opts = {}) {
     if (disposed || (!force && probeBackoffUntil > Date.now())) return {}
     if (probeRound !== null) return probeRound
-    const round = runProbeRound()
+    const round = runProbeRound({ probeForceLane: opts?.probeForceLane })
     probeRound = round
     try { return await round } finally { if (probeRound === round) probeRound = null }
   }

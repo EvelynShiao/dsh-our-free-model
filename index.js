@@ -1717,6 +1717,21 @@ function sanitizeSettings(patch, current) {
       ? next.hiddenModels.filter(id => typeof id === 'string' && id.length > 0 && id.length < 200).slice(0, 500)
       : (Array.isArray(current.hiddenModels) ? current.hiddenModels : [])
   }
+  /* 2026-10-23 探针手动控制（用户点名）：probeSkipFreeLane=true 时自动探针完全跳过
+     free 车道（不发起任何上游请求）——IP 匿名额度被 15 分钟一轮×十几模型的空转
+     烧穿是主因；catalog 刷新照常，可用性徽章显示 unknown 并标注「自动探测已关闭」。
+     手动「立即探测」不受此开关限制。 */
+  if (next.probeSkipFreeLane !== undefined) next.probeSkipFreeLane = next.probeSkipFreeLane === true
+  /* visibleModels（白名单制，2026-10-23 用户定案）：null/undefined = 全可见（默认
+     行为不变）；数组 = 只显示白名单内的。上游清单更新出新模型默认不可见，
+     白名单含已下架 id 无害。清洗与 hiddenModels 同款。 */
+  if (next.visibleModels !== undefined) {
+    next.visibleModels = next.visibleModels === null
+      ? null
+      : (Array.isArray(next.visibleModels)
+        ? next.visibleModels.filter(id => typeof id === 'string' && id.length > 0 && id.length < 200).slice(0, 500)
+        : (Array.isArray(current.visibleModels) ? current.visibleModels : null))
+  }
   return next
 }
 
@@ -1949,7 +1964,7 @@ function createApiRoutes(deps) {
       if (method === 'POST' && routePath === '/settings') {
         const patch = await readJson(req)
         const current = deps.settings.get()
-        const next = sanitizeSettings({ ...current, ...pick(patch, ['enabled', 'exposeRegionModels', 'probeIntervalMinutes', 'defaultMaxTokens', 'announcementAck', 'feedUrl', 'feedPollMinutes', 'notifyOs', 'updateCheckHours', 'autoReloadWatch', 'bridge', 'hiddenModels']) }, current)
+        const next = sanitizeSettings({ ...current, ...pick(patch, ['enabled', 'exposeRegionModels', 'probeIntervalMinutes', 'defaultMaxTokens', 'announcementAck', 'feedUrl', 'feedPollMinutes', 'notifyOs', 'updateCheckHours', 'autoReloadWatch', 'bridge', 'hiddenModels', 'probeSkipFreeLane', 'visibleModels']) }, current)
         if (patch.forward !== undefined) {
           const forward = { ...(current.forward ?? {}), ...pick(patch.forward, ['enabled', 'host', 'port']) }
           // The listener spends this machine's lane, and a routable bind address
@@ -2029,7 +2044,10 @@ function createApiRoutes(deps) {
         return send(200, { ok: true, ...buildSummary(deps) })
       }
       if (method === 'POST' && routePath === '/reprobe') {
-        await deps.refreshAvailability(true)
+        /* 2026-10-23：手动「立即探测」绕过 probeSkipFreeLane（用户点名要
+           手动控制权）——body.probeForceLane='free' 时 free 车道全量探测。 */
+        const body = await readJson(req).catch(() => ({}))
+        await deps.refreshAvailability(true, body?.probeForceLane === 'free' ? { probeForceLane: 'free' } : undefined)
         return send(200, { ok: true, ...buildSummary(deps) })
       }
       if (method === 'GET' && routePath === '/forward/key') {
@@ -2340,6 +2358,13 @@ function publicSettings(settings, forwardInfo, egressInfo) {
     enabled: settings.enabled !== false,
     exposeRegionModels: settings.exposeRegionModels !== false,
     probeIntervalMinutes: settings.probeIntervalMinutes ?? 15,
+    /* 2026-10-23 修「隐藏改不了」：publicSettings 此前不回传 hiddenModels，
+       Roster 读到的 summary.settings.hiddenModels 永远 undefined，
+       眼睛按钮点击后 UI 状态永不变（后端 listModels 过滤其实活着）。
+       probeSkipFreeLane（探针跳过 free 车道）一并回显。 */
+    hiddenModels: Array.isArray(settings.hiddenModels) ? settings.hiddenModels : [],
+    visibleModels: Array.isArray(settings.visibleModels) ? settings.visibleModels : null,
+    probeSkipFreeLane: settings.probeSkipFreeLane === true,
     defaultMaxTokens: settings.defaultMaxTokens ?? 0,
     bridge: {
       autostart: settings.bridge?.autostart !== false,

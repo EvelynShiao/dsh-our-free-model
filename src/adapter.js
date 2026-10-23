@@ -107,14 +107,22 @@ export class FreeModelAdapter {
   }
 
   /** Models this route advertises right now.
-   * hiddenModels（2026-10-20）：设置里勾掉的模型不进选择页——
-   * resolveModel 不过滤，旧会话里已选中的隐藏模型照常能跑。 */
+   * 模型选择页显隐（2026-10-20 hiddenModels；2026-10-23 用户定案改白名单制）：
+   * - visibleModels（白名单，用户点名）：数组存在时【只显示白名单内的模型】。
+   *   上游清单一更新，新模型默认不可见（不爆炸、不报错），想用去 Roster 点眼睛；
+   *   白名单里写了上游已下架的 id 也无害（过滤时自然落空）。
+   * - hiddenModels（旧黑名单）继续兼容：两者同时存在时取交集（既要白名单
+   *   认可、又没被旧黑名单排除）。
+   * - resolveModel 不过滤，旧会话里已选中的隐藏模型照常能跑。 */
   async listModels(provider) {
     const state = this.deps.state()
     const ids = new Set(state.membership[provider] ?? [])
     const hidden = new Set(Array.isArray(state.settings.hiddenModels) ? state.settings.hiddenModels : [])
+    const visible = Array.isArray(state.settings.visibleModels) ? new Set(state.settings.visibleModels) : null
     return state.catalog
-      .filter(entry => ids.has(entry.id) && !hidden.has(entry.id))
+      .filter(entry => ids.has(entry.id)
+        && !hidden.has(entry.id)
+        && (visible === null || visible.has(entry.id)))
       .map(entry => ({
         provider,
         id: entry.id,

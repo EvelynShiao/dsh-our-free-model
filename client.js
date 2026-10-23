@@ -2652,7 +2652,7 @@ window.__ModuleLoader__.load({
 
     // ── model roster ──────────────────────────────────────────────────────────
     function ModelCard(props) {
-      const { model: m, t, onBench, bench, locked, eacLogin, hidden, onToggleHidden } = props
+      const { model: m, t, onBench, bench, locked, eacLogin, hidden, onToggleHidden, visibleMode } = props
       const stateKey = `state.${m.availability}`
       const dim = m.availability !== 'available'
       const rung = (m.budgets ?? []).find(row => row.isDefault === true)
@@ -2664,9 +2664,11 @@ window.__ModuleLoader__.load({
           /* 显隐按钮（2026-10-20 用户点名）：切换「是否显示在模型选择页」——隐藏后 listModels 滤掉，旧会话照用。 */
           h('span', {
             className: 'ofm_chantag', style: { cursor: 'pointer' },
-            title: hidden === true ? '已隐藏（不在模型选择页显示；点击恢复显示）' : '显示在模型选择页中（点击隐藏）',
+            title: hidden === true
+              ? (visibleMode === true ? '不在白名单（选择页不显示；点击加入白名单）' : '已隐藏（不在模型选择页显示；点击恢复显示）')
+              : '显示在模型选择页中（点击隐藏）',
             onClick: onToggleHidden,
-          }, hidden === true ? '👁‍🗨已隐藏' : '👁显示中'),
+          }, hidden === true ? (visibleMode === true ? '👁不在白名单' : '👁‍🗨已隐藏') : '👁显示中'),
           h('span', { className: 'ofm_cardname', title: m.name }, m.name),
           h('span', { className: 'ofm_badge ' + m.availability }, t(stateKey))),
         h('div', { className: 'ofm_id', title: m.id }, m.id),
@@ -2697,7 +2699,7 @@ window.__ModuleLoader__.load({
     }
 
     function Roster(props) {
-      const { summary, t, onBench, benches, auth, eacLogin, only } = props
+      const { summary, t, onBench, benches, auth, eacLogin, only, reprobe } = props
       // `only` splits the same roster across the two model pages: the EAC page
       // shows the co-paid entries, the free page everything else. Filtering
       // here (rather than in each page) keeps one definition of what a route
@@ -2712,26 +2714,86 @@ window.__ModuleLoader__.load({
       const locked = auth !== undefined && auth.available === true && auth.authorized !== true
       // 显隐（2026-10-20 用户点名「每个模型加个是否显示在模型选择页的按钮」）：
       // hiddenModels 存设置里（后端 listModels 过滤），resolveModel 不过滤（旧会话照用）。
+      /* 2026-10-23 修「点击改不了+强制刷新」（用户实锤）：
+         ① 旧代码 window.location.reload()——每点一次眼睛刷一次整页；
+         ② publicSettings 不回传 hiddenModels，刷新后 hiddenSet 依旧空 →
+           眼睛状态永远回跳，看起来"根本改不了"（后端已同步修回显）。
+         现改为乐观更新：本地 useState 即时翻转，POST 失败才回滚，不刷新页面。 */
+      /* 白名单制（2026-10-23 用户定案）：visibleModels 非 null 时眼睛按钮=白名单
+       * 进出；null 时沿用旧 hiddenModels 黑名单。两种模式的按钮语义：
+       * 白名单模式——👁显示中=在白名单里；点眼睛=加入/移出白名单。
+       * 黑名单模式——保持原语义（隐藏=从选择页滤掉）。 */
       const [busyHide, setBusyHide] = useState(false)
-      const hiddenSet = new Set(Array.isArray(summary.settings?.hiddenModels) ? summary.settings.hiddenModels : [])
+      const [hiddenOverride, setHiddenOverride] = useState(null)
+      const [visibleOverride, setVisibleOverride] = useState(undefined)
+      const visibleListRaw = summary.settings?.visibleModels
+      const visibleList = visibleOverride !== undefined ? visibleOverride : (Array.isArray(visibleListRaw) ? visibleListRaw : null)
+      const hiddenSet = new Set(hiddenOverride ?? (Array.isArray(summary.settings?.hiddenModels) ? summary.settings.hiddenModels : []))
+      const visibleSet = visibleList === null ? null : new Set(visibleList)
+      const applyHidden = async next => {
+        const prev = hiddenOverride ?? (Array.isArray(summary.settings?.hiddenModels) ? summary.settings.hiddenModels : [])
+        setHiddenOverride(next)
+        try {
+          await post('/settings', { hiddenModels: next })
+        } catch (e) {
+          setHiddenOverride(prev) /* 回滚 */
+        }
+      }
+      const applyVisible = async next => {
+        const prev = visibleList ?? null
+        setVisibleOverride(next)
+        try {
+          await post('/settings', { visibleModels: next })
+        } catch (e) {
+          setVisibleOverride(prev) /* 回滚 */
+        }
+      }
       const toggleHidden = async id => {
         if (busyHide) return
         setBusyHide(true)
         try {
-          const next = hiddenSet.has(id) ? [...hiddenSet].filter(x => x !== id) : [...hiddenSet, id]
-          await post('/settings', { hiddenModels: next })
-          window.location.reload()
-        } catch (e) { /* 失败静默——设置页顶层 note 由 onApply 展示 */ }
-        finally { setBusyHide(false) }
+          if (visibleList !== null) {
+            /* 白名单模式：切换 id 在白名单里的进出 */
+            const next = visibleSet.has(id) ? visibleList.filter(x => x !== id) : [...visibleList, id]
+            await applyVisible(next)
+          } else {
+            const next = hiddenSet.has(id) ? [...hiddenSet].filter(x => x !== id) : [...hiddenSet, id]
+            await applyHidden(next)
+          }
+        } finally { setBusyHide(false) }
       }
+      /* 批量显隐（2026-10-23 用户点名）：一组模型一键全隐/全显。
+         白名单模式下 hideAll=把这组清出白名单、showAll=把这组全部加进白名单。 */
+      const hideAll = async ids => {
+        if (busyHide) return
+        setBusyHide(true)
+        try {
+          if (visibleList !== null) await applyVisible(visibleList.filter(x => !ids.includes(x)))
+          else await applyHidden([...new Set([...hiddenSet, ...ids])])
+        } finally { setBusyHide(false) }
+      }
+      const showAll = async ids => {
+        if (busyHide) return
+        setBusyHide(true)
+        try {
+          if (visibleList !== null) await applyVisible([...new Set([...visibleList, ...ids])])
+          else await applyHidden([...hiddenSet].filter(x => !ids.includes(x)))
+        } finally { setBusyHide(false) }
+      }
+      /* 批量显隐（2026-10-23 用户点名）：组头加「隐藏本组/显示本组」，
+         一键把整组模型从选择页收起/放回。 */
       const group = (title, list, hint) => list.length === 0 ? null
         : h('div', { className: 'ofm_sec', style: { gap: 8 } },
           h('div', { className: 'ofm_row' }, h('span', { className: 'ofm_sec_title', style: { fontSize: 12.5 } }, title),
-            hint === undefined ? null : h('span', { className: 'ofm_sec_hint' }, hint)),
+            hint === undefined ? null : h('span', { className: 'ofm_sec_hint' }, hint),
+            h('span', { style: { marginLeft: 'auto', display: 'flex', gap: 6 } },
+              h(Button, { kind: 'ghost', disabled: busyHide, onClick: () => void hideAll(list.map(m => m.id)) }, t('roster.hideGroup') || '隐藏本组'),
+              h(Button, { kind: 'ghost', disabled: busyHide, onClick: () => void showAll(list.map(m => m.id)) }, t('roster.showGroup') || '显示本组'))),
           h('div', { className: 'ofm_grid' }, list.map(m => h(ModelCard, {
             key: m.id, model: m, t, onBench, locked: m.channel === 'eac' && locked, eacLogin,
             bench: { running: benches[m.id]?.running === true, ...benches[m.id]?.result === undefined ? {} : { result: benches[m.id].result } },
-            hidden: hiddenSet.has(m.id),
+            hidden: visibleSet === null ? hiddenSet.has(m.id) : !visibleSet.has(m.id),
+            visibleMode: visibleSet !== null,
             onToggleHidden: () => void toggleHidden(m.id),
           }))))
       // The lane closed at the gate is the one "no EAC models" case the page can
@@ -2741,7 +2803,25 @@ window.__ModuleLoader__.load({
         ? h('p', { className: 'ofm_note' }, t('roster.noLane')) : null
       // 暂不可用的模型不再单独成组展示（用户要求移除「不在选择器中」区块）：
       // 它们的状态仍在上方统计芯片与每张卡的徽章里如实可见。
+      /* 探针手动控制（2026-10-23 用户点名）：跳过 free 车道自动探测 + 探测间隔
+         分钟数可改，都在模型清单顶部直接操作，不用进设置页。 */
+      const probeInterval = Number(summary.settings?.probeIntervalMinutes ?? 15)
+      const probeSkip = summary.settings?.probeSkipFreeLane === true
+      const [probeIntervalDraft, setProbeIntervalDraft] = useState(probeInterval)
+      const [probeBusy, setProbeBusy] = useState(false)
+      const setProbeOpt = async patch => {
+        if (probeBusy) return
+        setProbeBusy(true)
+        try { await post('/settings', patch) } finally { setProbeBusy(false) }
+      }
       return h(Fragment, null,
+        h('div', { className: 'ofm_row', style: { gap: 8, flexWrap: 'wrap', marginBottom: 8 } },
+          h(Switch, { checked: probeSkip, label: '自动探测：跳过免费车道（省 IP 匿名额度）', onChange: () => void setProbeOpt({ probeSkipFreeLane: !probeSkip }) }),
+          h('span', { className: 'ofm_pill' }, '探测间隔（分钟）'),
+          h('input', { className: 'ofm_input', style: { maxWidth: 80 }, value: probeIntervalDraft,
+            onChange: e => setProbeIntervalDraft(Number(e.target.value.replace(/[^0-9]/g, '')) || 0) }),
+          h(Button, { kind: 'ghost', disabled: probeBusy || probeIntervalDraft === probeInterval, onClick: () => void setProbeOpt({ probeIntervalMinutes: Math.max(1, probeIntervalDraft) }) }, '应用间隔'),
+          h(Button, { kind: 'primary', disabled: probeBusy, onClick: () => void reprobe() }, '立即探测')),
         laneNote,
         group(t('state.available'), available),
         group(t('state.region-blocked'), limited, t('hint.region')))
@@ -5642,7 +5722,7 @@ window.__ModuleLoader__.load({
       }
       const reprobe = async () => {
         setBusy(true)
-        try { await post('/reprobe', undefined, 600_000); summary.reload() } finally { setBusy(false) }
+        try { await post('/reprobe', { probeForceLane: 'free' }, 600_000); summary.reload() } finally { setBusy(false) }
       }
 
       const tabs = [
@@ -5745,7 +5825,7 @@ window.__ModuleLoader__.load({
               h('div', { className: 'ofm_row' },
                 h(Button, { disabled: busy, onClick: refresh }, summary.status === 'loading' ? t('probing') : t('refresh')),
                 h(Button, { disabled: busy, onClick: reprobe }, t('reprobe')))))),
-        h(Section, { title: t('section.models'), hint: t('section.modelsHint') }, h(Roster, { summary: data, t, onBench: bench, benches, auth: eacAuth, eacLogin, only: 'free' })),
+        h(Section, { title: t('section.models'), hint: t('section.modelsHint') }, h(Roster, { summary: data, t, onBench: bench, benches, auth: eacAuth, eacLogin, only: 'free', reprobe })),
         h(Section, { title: t('section.dash'), hint: t('section.dashHint') },
           stats.status === 'ready' && stats.data !== undefined ? h(Dashboard, { stats: stats.data, summary: data, t })
             : h('p', { className: 'ofm_note' }, t('loading'))),
@@ -5809,7 +5889,7 @@ window.__ModuleLoader__.load({
                 h(Button, { disabled: busy, onClick: refresh }, summary.status === 'loading' ? t('probing') : t('refresh')),
                 h(Button, { disabled: busy, onClick: reprobe }, t('reprobe')))))),
         h(Section, { title: t('section.eac'), hint: t('section.eacHint') }, h(EacAuth, { t, auth: eacAuth, eacLogin })),
-        h(Section, { title: t('section.models'), hint: t('section.modelsHint') }, h(Roster, { summary: data, t, onBench: bench, benches, auth: eacAuth, eacLogin, only: 'eac' })),
+        h(Section, { title: t('section.models'), hint: t('section.modelsHint') }, h(Roster, { summary: data, t, onBench: bench, benches, auth: eacAuth, eacLogin, only: 'eac', reprobe })),
         h(Section, { title: t('section.news'), hint: t('section.newsHint') }, h(NewsPanel, { t })))
     }
 
