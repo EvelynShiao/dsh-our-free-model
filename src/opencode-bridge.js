@@ -322,6 +322,19 @@ function headers(svc) {
  * 默认 build——管道仍能用，只是工具协议可能再次失灵（可自愈见 ensurePipeAgent）。
  */
 export const BRIDGE_AGENT = 'mute2'
+/* 2026-10-24 探针轻量化（用户点名「绕开不注入提示词」）：探针建会话用 mute3——
+   tools 全关('*':false) + skills:false，opencode 的 instruction 注入引擎按 agent
+   配置过滤，mute3 会话里不再注入 8 个 namespace 的工具/skill 说明书（实测
+   mute2 会话注入 ~9600 字符 ≈ 2500-3200 token，探针一次的真实开销大头）。
+   探针只需要「能生成一个字」的判定，零工具语义完全够用。 */
+export const PROBE_AGENT = 'mute3'
+const PROBE_AGENT_CONFIG = {
+  description: 'probe-only dumb pipe: zero tools, zero skills',
+  mode: 'primary',
+  tools: { '*': false },
+  skills: false,
+  permissions: [{ action: '*', resource: '*', effect: 'allow' }],
+}
 
 /** mute2 的 agent 配置（写进用户 opencode.json 的形状）。 */
 const PIPE_AGENT_CONFIG = {
@@ -336,6 +349,22 @@ const PIPE_AGENT_CONFIG = {
  * 幂等：已存在且配置一致就不动用户文件；存在但形状不对才补写。
  * 失败不抛——agent 缺席时管道退回 build，功能还在。
  */
+export function ensureProbeAgent() {
+  try {
+    const cfgPath = join(homedir(), '.config', 'opencode', 'opencode.json')
+    let cfg = {}
+    try { cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8')) } catch { /* 首次创建 */ }
+    const agents = (cfg.agent = cfg.agent && typeof cfg.agent === 'object' ? cfg.agent : {})
+    const existing = agents[PROBE_AGENT]
+    const wanted = JSON.stringify(PROBE_AGENT_CONFIG)
+    if (existing !== undefined && JSON.stringify(existing) === wanted) return true
+    agents[PROBE_AGENT] = PROBE_AGENT_CONFIG
+    fs.mkdirSync(join(cfgPath, '..'), { recursive: true })
+    fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2))
+    return true
+  } catch { return false }
+}
+
 export function ensurePipeAgent() {
   try {
     const cfgPath = join(homedir(), '.config', 'opencode', 'opencode.json')
@@ -358,12 +387,13 @@ export function ensurePipeAgent() {
  * @param {string} modelId - zen 模型 id（如 mimo-v2.6-flash-free）
  * @param {string} directory - 工作目录（服务要求一个 location）
  */
-export async function createSession(svc, modelId, directory, signal) {
+export async function createSession(svc, modelId, directory, signal, agent = BRIDGE_AGENT) {
   ensurePipeAgent()
+  if (agent === PROBE_AGENT) ensureProbeAgent()
   let res = await fetch(`${svc.url}/api/session`, {
     method: 'POST',
     headers: headers(svc),
-    body: JSON.stringify({ agent: BRIDGE_AGENT, location: { directory }, model: { providerID: 'opencode', id: modelId } }),
+    body: JSON.stringify({ agent, location: { directory }, model: { providerID: 'opencode', id: modelId } }),
     signal: signal ?? AbortSignal.timeout(15000),
   });
   let doc = null;
@@ -602,7 +632,7 @@ export async function bridgeStream({ modelId, prompt, directory, signal, onDelta
  * @param {{modelId:string, prompt:string, directory?:string, signal?:AbortSignal}} options
  * @returns {Promise<string>} 模型输出文本
  */
-export async function bridgeGenerate({ modelId, prompt, directory, signal, autostart = bridgeConfig.autostart }) {
+export async function bridgeGenerate({ modelId, prompt, directory, signal, autostart = bridgeConfig.autostart, agent }) {
   const id = assertFreeModel(modelId);
   let svc = await ensureService({ autostart });
   /* 与 bridgeStream 同源的洞：服务不在时不再直接抛错，当场拉起（见 2026-10-22 补丁注释）。 */
@@ -613,6 +643,6 @@ export async function bridgeGenerate({ modelId, prompt, directory, signal, autos
   }
   noteBridgeUse()
   const dir = directory ?? process.env.DSH_HOME ?? homedir();
-  const session = await createSession(svc, id, dir, signal);
+  const session = await createSession(svc, id, dir, signal, agent);
   return generateInSession(svc, session.id, id, prompt, signal);
 }

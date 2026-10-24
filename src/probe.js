@@ -61,7 +61,10 @@ export async function probeModel(model, { attributionUserAgent, signal, timeoutM
   }
   if (readService() !== null) {
     try {
-      await bridgeGenerate({ modelId: model.id, prompt: 'ping', signal, autostart: false })
+      /* 2026-10-24 探针轻量化（用户点名「绕开不注入提示词」）：走 mute3——
+         tools 全关 + skills 关，opencode 不再给探针会话注入 ~9600 字符的
+         工具/skill 说明书（那是探针 token 开销的大头）。只发一个 'ping'。 */
+      await bridgeGenerate({ modelId: model.id, prompt: 'ping', signal, autostart: false, agent: 'mute3' })
       return { state: STATE.available, latencyMs: Date.now() - started }
     } catch (error) {
       return {
