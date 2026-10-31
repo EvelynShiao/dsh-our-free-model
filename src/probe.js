@@ -18,7 +18,7 @@ import { applyFingerprint, endpointFor, mintRequestId, sessionForConversation, w
 import { CODE, postStreamed } from './http.js'
 import { egressFetch } from './egress.js'
 /* 2026-10-14：免费车道改走本地 opencode 服务代发（OpenCode v2 门禁后唯一合法通道）。 */
-import { bridgeGenerate, readService, hasOpencodeCli, BRIDGE_IDLE_HINT } from './opencode-bridge.js'
+import { bridgeGenerate, readService, ensureService, hasOpencodeCli, BRIDGE_IDLE_HINT } from './opencode-bridge.js'
 
 /** Public-echo sources, tried in order; any one answering is enough. */
 const ECHO_SOURCES = [
@@ -56,22 +56,33 @@ export async function probeModel(model, { attributionUserAgent, signal, timeoutM
      一轮的自动探测会把服务变回常驻，"平时不占内存"就白做了。服务没跑时报 unknown
      （模型仍留在列表里：computeMembership 只排除 unavailable），详情写明首次使用会
      自动拉起。 */
-  if (readService() === null && hasOpencodeCli()) {
-    return { state: STATE.unknown, detail: BRIDGE_IDLE_HINT, latencyMs: Date.now() - started }
+  /* 2026-10-28：活性判定改用 ensureService({autostart:false})——它内部会真连端口。
+     此前裸调 readService()，服务已停但 ~/.config/opencode/service.json 那份陈旧
+     备胎（只有 password、没有 url）仍让它返回 127.0.0.1:4096，于是探针跳过
+     「服务未启动」这条干净分支，去连一个死端口，把 idle 说明换成了连接错误。 */
+  const live = await ensureService({ autostart: false })
+  if (live === null) {
+    return {
+      state: STATE.unknown,
+      detail: hasOpencodeCli() ? BRIDGE_IDLE_HINT : '本机未安装 opencode 客户端；免费车道需要它代发',
+      latencyMs: Date.now() - started,
+    }
   }
-  if (readService() !== null) {
-    try {
-      /* 2026-10-24 探针轻量化（用户点名「绕开不注入提示词」）：走 mute3——
-         tools 全关 + skills 关，opencode 不再给探针会话注入 ~9600 字符的
-         工具/skill 说明书（那是探针 token 开销的大头）。只发一个 'ping'。 */
-      await bridgeGenerate({ modelId: model.id, prompt: 'ping', signal, autostart: false, agent: 'mute3' })
-      return { state: STATE.available, latencyMs: Date.now() - started }
-    } catch (error) {
-      return {
-        state: STATE.unknown,
-        detail: String(error?.message ?? error).slice(0, 200),
-        latencyMs: Date.now() - started,
-      }
+  try {
+    /* 2026-10-24 探针轻量化（用户点名「绕开不注入提示词」）：走 mute3——
+       tools 全关 + skills 关，opencode 不再给探针会话注入 ~9600 字符的
+       工具/skill 说明书（那是探针 token 开销的大头）。只发一个 'ping'。 */
+    await bridgeGenerate({ modelId: model.id, prompt: 'ping', signal, autostart: false, agent: 'mute3' })
+    return { state: STATE.available, latencyMs: Date.now() - started }
+  } catch (error) {
+    /* 2026-10-28（用户点名「测了失败还显示可用」）：失败必须分类，不能再一律
+       记 unknown——unknown 不被 picker 过滤、徽章只是灰字，等于「看着可用」。
+       bridge 抛的是普通 Error（状态码只写在文本里），stateOf 会从文本兜出来。 */
+    const detail = String(error?.message ?? error).slice(0, 200)
+    return {
+      state: stateOf({ code: error?.code, status: error?.status, message: detail, unavailable: error?.unavailable }),
+      detail,
+      latencyMs: Date.now() - started,
     }
   }
   const session = sessionForConversation('probe:our-free-model')
@@ -112,7 +123,10 @@ export async function probeModel(model, { attributionUserAgent, signal, timeoutM
       },
     })
     if (streamError !== undefined) {
-      return { state: STATE.unknown, detail: streamError.slice(0, 200), latencyMs: Date.now() - started }
+      /* 2026-10-28：上游把拒绝放在 200 流里（EAC 对已下线模型就是先开流、再发
+         一条不带 finish 标记的 `{"error":…}` 帧就断），这条分支此前也记 unknown，
+         于是「模型已下线」永远不摘牌。 */
+      return { state: stateOf({ message: streamError }), detail: streamError.slice(0, 200), latencyMs: Date.now() - started }
     }
     return { state: STATE.available, latencyMs: Date.now() - started, ttftMs: firstDelta === undefined ? undefined : firstDelta - started }
   } catch (error) {
@@ -175,23 +189,38 @@ function buildPing(modelId, wire) {
  */
 const ROUTING_REFUSAL_STATUS = new Set([400, 404, 422])
 
+/* 2026-10-28：stateOf 供离线套件直测（分类规则是纯函数，不碰网络）。 */
+export const stateOfForTest = stateOf
+
 function stateOf(error) {
   switch (error?.code) {
     case CODE.region: return STATE.regionBlocked
     case CODE.quota: return STATE.throttled
+    case CODE.timeout: return STATE.throttled
     default: break
   }
   const message = String(error?.message ?? '')
-  // The message match is a fallback for a refusal the classifier did not name
-  // ("no such model", "unknown model"), so it may only speak when the status did
-  // not already answer on the gateway's behalf: 503 is spelled "Service
-  // Unavailable" by every reverse proxy, and reading that reason phrase as the
-  // gateway naming this model dropped a working model until the next round.
+  /* 2026-10-28：上游点名「这个模型不给你」的措辞，明确到足以摘牌，且不受 5xx
+     guard 约束——EAC 对退役模型报 "reached its end of life"（装在 HTTP 200 的
+     SSE 流里），对坏路由报 "Function … Not found for account"（账户级配置缺失）；
+     opencode 网关对不存在的模型报 "Model unavailable: <id>"，点名了 id，不是
+     反向代理那句笼统的 "Service Unavailable"。 */
+  if (/end of life|not found for account|model unavailable|no such model|unknown model|invalid model|not supported/i.test(message)) return STATE.unavailable
   const gatewayTrouble = Number.isInteger(error?.status) && error.status >= 500
+  // The message match is a fallback for a refusal the classifier did not name,
+  // so it may only speak when the status did not already answer on the gateway's
+  // behalf: 503 is spelled "Service Unavailable" by every reverse proxy, and
+  // reading that reason phrase as the gateway naming this model dropped a
+  // working model until the next round.
   const named = error?.unavailable === true
-    || (!gatewayTrouble && /unavailable|not supported|no such model|unknown model|invalid model/i.test(message))
+    || (!gatewayTrouble && /unavailable/i.test(message))
   if (named) return STATE.unavailable
   if (Number.isInteger(error?.status) && ROUTING_REFUSAL_STATUS.has(error.status)) return STATE.unavailable
+  /* 2026-10-28（用户点名「测了失败还显示可用」）：5xx / 超时 / 连接失败这类
+     「这次没答上来」不再落 unknown——unknown 是灰字「未探测」，看着像可用。
+     改 throttled：红色「暂不可用」徽章、模型仍留在列表，额度或负载恢复后
+     下一轮探测自愈。bridge 抛的是普通 Error，503 只出现在文本里（HTTP 5xx）。 */
+  if (gatewayTrouble || /timed? ?out|timeout|time limit|fetch failed|econn|socket|http 5\d\d|aborted/i.test(message)) return STATE.throttled
   return STATE.unknown
 }
 
