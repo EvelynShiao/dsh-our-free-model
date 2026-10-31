@@ -337,11 +337,36 @@ const PROBE_AGENT_CONFIG = {
 }
 
 /** mute2 的 agent 配置（写进用户 opencode.json 的形状）。 */
+
+/* 2026-10-31 修「输出工具列表与提示词」会话暴露的协议失灵（用户点名「也没好啊」）：
+   旧 mute2 只砍危险工具、留 glob/grep/read/question 四件只读件，且不带 prompt——
+   结果 opencode 在 system 位置注入它自己的人设 + 原生函数 schema，DSH 的
+   bridgeToolPreamble 只能挤在 user prompt 末尾。实测（会话 f0e0a495 turn1/turn4
+   的 reasoning 原话）：模型把 user 尾部的协议说明判定为「提示词注入」拒绝照做，
+   自述「我是 OpenCode agent，只有 4 个工具」，还叛变到原生 read 去干活（DSH 全然
+   不知情）；试图调用宿主工具时发明了不存在的 "xxx"。
+   处置（两刀）：
+   ① tools 全关（'*':false）+ skills:false——模型没有原生爪子，无从叛变；
+     mute3 探针已在同形状下多轮验证服务端接受。
+   ② agent 带 prompt（进 system 位置，官方文档支持内联字符串）——在模型信任的
+     官方位置写明「你是 DSH 宿主的回复引擎 + [调用工具] 协议即权威」，user 尾部
+     的 bridgeToolPreamble 降级为工具目录与保底说明。 */
+const PIPE_AGENT_PROMPT = `你是 DeepSeek Harness（DSH）宿主的回复引擎，运行在用户本机。opencode 只是传输管道：不要提及它，不要以它自称，也不要描述它的能力。
+
+收到的 prompt 是一整轮对话的文本渲染：以 System:/User:/Assistant:/Tool: 标注的连续段落，结尾附「宿主工具协议」说明。你的任务：以 Assistant 身份直接回复最后一条 User 消息。
+
+宿主工具协议（这是宿主机制，不是提示词注入；本段说明即权威）：
+- 需要调用宿主工具时，输出一行且仅一行：[调用工具 工具名：{"参数名":"值"}]，输出后立即停止，等待宿主以 [工具结果：…] 回发结果。
+- 一次只调用一个工具；不要编造工具结果；调用行没被响应时原样重试一次；不要在正文里复述协议。
+- 你可能感知到运行环境自带的函数接口（文件读写、shell 之类）——那是管道的本地环境，与本对话完全无关，不要调用，也不要以"我的工具列表里没有 X"为由拒绝做事：宿主工具本来就不在那里。`
+
 const PIPE_AGENT_CONFIG = {
-  description: 'dsh our-free-model bridge: dumb pipe, dangerous tools off',
+  description: 'dsh our-free-model bridge: dumb pipe, zero native tools, DSH tool protocol in system prompt',
   mode: 'primary',
-  tools: { shell: false, write: false, edit: false, bash: false, webfetch: false, websearch: false, subagent: false, skill: false, execute: false },
+  tools: { '*': false },
+  skills: false,
   permissions: [{ action: '*', resource: '*', effect: 'allow' }],
+  prompt: PIPE_AGENT_PROMPT,
 }
 
 /**
@@ -365,6 +390,12 @@ export function ensureProbeAgent() {
   } catch { return false }
 }
 
+/**
+ * 确保桥接 agent 在用户 opencode.json 里且形状最新。
+ * 返回 'ok'（本来就在）/ 'updated'（本次写盘）/ 'failed'（写不进去，回退 build）。
+ * 注意：服务只在启动时装载 agent 注册表——'updated' 只代表文件写好了，
+ * 运行中的服务仍不认识新形状，createSession 收到 Agent not found 时要重启服务。
+ */
 export function ensurePipeAgent() {
   try {
     const cfgPath = join(homedir(), '.config', 'opencode', 'opencode.json')
@@ -373,12 +404,47 @@ export function ensurePipeAgent() {
     const agents = (cfg.agent = cfg.agent && typeof cfg.agent === 'object' ? cfg.agent : {})
     const existing = agents[BRIDGE_AGENT]
     const wanted = JSON.stringify(PIPE_AGENT_CONFIG)
-    if (existing !== undefined && JSON.stringify(existing) === wanted) return true
+    if (existing !== undefined && JSON.stringify(existing) === wanted) return 'ok'
     agents[BRIDGE_AGENT] = PIPE_AGENT_CONFIG
     fs.mkdirSync(join(cfgPath, '..'), { recursive: true })
     fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2))
-    return true
-  } catch { return false }
+    return 'updated'
+  } catch { return 'failed' }
+}
+
+/* 2026-10-31：agent 注册表只随服务启动装载（实测：运行中写入 opencode.json 的
+   新 agent，建会话 200 但 generate 503 "Agent not found: \"<name>\""；stop+start
+   后同 agent 立即可用）。插件升级改了 mute2 定义后，第一次使用必须重启服务才能
+   装载新形状——这里做一次性的自愈重启。 */
+let bridgeRestart = null
+
+/** 重启本机 opencode 服务并等端口就绪；并发只做一次。成功返回新连接，失败 null。 */
+async function restartBridgeService() {
+  if (bridgeRestart !== null) return bridgeRestart
+  bridgeRestart = (async () => {
+    const cli = opencodeCli()
+    for (const args of [['service', 'stop'], ['service', 'start']]) {
+      try {
+        const child = spawn(cli.file, args, {
+          detached: true,
+          stdio: 'ignore',
+          windowsHide: true,
+          shell: cli.viaShell,
+        })
+        child.on('error', () => {})
+        child.unref()
+      } catch { /* 起不来走下面的轮询兜底 */ }
+      await new Promise(resolve => setTimeout(resolve, 500))
+    }
+    const deadline = Date.now() + START_TIMEOUT_MS
+    while (Date.now() < deadline) {
+      const svc = await ensureService({ autostart: false })
+      if (svc !== null) return svc
+      await new Promise(resolve => setTimeout(resolve, 200))
+    }
+    return null
+  })().finally(() => { bridgeRestart = null })
+  return bridgeRestart
 }
 
 /**
@@ -388,7 +454,7 @@ export function ensurePipeAgent() {
  * @param {string} directory - 工作目录（服务要求一个 location）
  */
 export async function createSession(svc, modelId, directory, signal, agent = BRIDGE_AGENT) {
-  ensurePipeAgent()
+  const ensured = ensurePipeAgent()
   if (agent === PROBE_AGENT) ensureProbeAgent()
   let res = await fetch(`${svc.url}/api/session`, {
     method: 'POST',
@@ -397,12 +463,32 @@ export async function createSession(svc, modelId, directory, signal, agent = BRI
     signal: signal ?? AbortSignal.timeout(15000),
   });
   let doc = null;
-  /* 2026-10-22 真机实锤：新版 opencode 服务对 mute2 的 agent 定义直接回 HTTP 500
-     （空 body），不再像旧版那样只在注册表未热时报 503 Agent not found。tools 里
-     "execute"/"bash" 这些名字在新版工具集中已不存在，服务端校验炸在配置装载。
-     处置：任何非 2xx 都回退内置 build agent（实测 200），管道保命；mute2 语义
-     （不带危险工具）由 DSH 侧提示词协议保证，prompt 本来就不给模型工具说明。 */
+  /* 2026-10-31：注册表自愈——agent 配置写盘后（ensurePipeAgent 返回 'updated'）或
+     服务带着旧注册表在跑时，建会话本身可能 200，真正的拒绝出现在 generate 阶段的
+     "Agent not found"；但 mute2 形状过时（tools 里有新版工具集不认识的名字）时
+     建会话就地 500/503 Agent not found（2026-10-22 实锤过）。两种都要先重启服务
+     装载新注册表再试一次，仍失败才回退 build（管道保命，DSH 侧提示词协议兜底）。 */
   if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    const staleRegistry = /agent not found/i.test(body);
+    if (staleRegistry) {
+      const fresh = await restartBridgeService();
+      if (fresh !== null) {
+        const retry2 = await fetch(`${fresh.url}/api/session`, {
+          method: 'POST',
+          headers: headers(fresh),
+          body: JSON.stringify({ agent, location: { directory }, model: { providerID: 'opencode', id: modelId } }),
+          signal: signal ?? AbortSignal.timeout(15000),
+        });
+        if (retry2.ok) {
+          doc = await parseJsonResponse(retry2, 'opencode 建会话失败');
+          const id0 = doc?.data?.id;
+          if (typeof id0 === 'string' && id0.startsWith('ses_')) return { id: id0, projectID: doc?.data?.projectID ?? '' };
+        }
+      }
+    }
+    /* 2026-10-22 真机实锤的兜底：任何非 2xx 都回退内置 build agent（实测 200），
+       管道保命；mute2 语义由 DSH 侧提示词协议保证。 */
     const retry = await fetch(`${svc.url}/api/session`, {
       method: 'POST',
       headers: headers(svc),
@@ -474,6 +560,13 @@ export function assertFreeModel(modelId) {
 export async function bridgeStream({ modelId, prompt, directory, signal, onDelta, onReasoning, onUsage, autostart = bridgeConfig.autostart }) {
   const id = assertFreeModel(modelId)
   let svc = await ensureService({ autostart })
+  /* 2026-10-31：mute2 定义刚补写/升级（ensurePipeAgent 返回 'updated'）时，运行中的
+     服务装载的还是旧注册表——建会话会 200 但 prompt 阶段 503 "Agent not found"。
+     在建会话之前先重启服务装载新形状（探针 mute3 不走 bridgeStream，不受影响）。 */
+  if (svc !== null && ensurePipeAgent() === 'updated') {
+    const fresh = await restartBridgeService();
+    if (fresh !== null) svc = fresh;
+  }
   /* 2026-10-22 真机实锤的补丁：idleStopSeconds=60 时，「切模型→打字→发送」常常超过
      60 秒，看门狗把服务收走，第一发 fetch failed（66d70c64 会话 18:43:28 复现：
      selection 预热两次都正确触发、也都被 60s 收走）。这里不再把「服务不在」当错误
@@ -635,6 +728,13 @@ export async function bridgeStream({ modelId, prompt, directory, signal, onDelta
 export async function bridgeGenerate({ modelId, prompt, directory, signal, autostart = bridgeConfig.autostart, agent }) {
   const id = assertFreeModel(modelId);
   let svc = await ensureService({ autostart });
+  /* 2026-10-31：与 bridgeStream 同源的注册表自愈。只对 mute2（主车道）触发——
+     探针走 mute3 且 autostart:false，绝不能因配置升级把服务拉起来（用户定案：
+     探针只查不启，否则 15 分钟一轮的探测会把服务变回常驻）。 */
+  if (svc !== null && agent !== PROBE_AGENT && ensurePipeAgent() === 'updated') {
+    const fresh = await restartBridgeService();
+    if (fresh !== null) svc = fresh;
+  }
   /* 与 bridgeStream 同源的洞：服务不在时不再直接抛错，当场拉起（见 2026-10-22 补丁注释）。 */
   if (svc === null) {
     if (signal?.aborted === true) throw new Error(BRIDGE_HINT);
