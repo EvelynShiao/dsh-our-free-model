@@ -200,6 +200,9 @@ function stateOf(error) {
     default: break
   }
   const message = String(error?.message ?? '')
+  /* 2026-10-31：地区墙先行——bridge 抛的错没有 code，opencode 对地区外模型在
+     503 体里说 "This model is not available in your country"，只有这里能认出。 */
+  if (/not available in your country/i.test(message)) return STATE.regionBlocked
   /* 2026-10-28：上游点名「这个模型不给你」的措辞，明确到足以摘牌，且不受 5xx
      guard 约束——EAC 对退役模型报 "reached its end of life"（装在 HTTP 200 的
      SSE 流里），对坏路由报 "Function … Not found for account"（账户级配置缺失）；
@@ -207,13 +210,10 @@ function stateOf(error) {
      反向代理那句笼统的 "Service Unavailable"。 */
   if (/end of life|not found for account|model unavailable|no such model|unknown model|invalid model|not supported/i.test(message)) return STATE.unavailable
   const gatewayTrouble = Number.isInteger(error?.status) && error.status >= 500
-  // The message match is a fallback for a refusal the classifier did not name,
-  // so it may only speak when the status did not already answer on the gateway's
-  // behalf: 503 is spelled "Service Unavailable" by every reverse proxy, and
-  // reading that reason phrase as the gateway naming this model dropped a
-  // working model until the next round.
+  /* 2026-10-31：不再用 /unavailable/i 兜底——opencode 的 503 响应体带
+     `_tag:"ServiceUnavailableError"`，那个词命中它，把额度类错误全污染成
+     「点名摘牌」。点名的措辞上面那条强正则已全覆盖，这里只信显式标记。 */
   const named = error?.unavailable === true
-    || (!gatewayTrouble && /unavailable/i.test(message))
   if (named) return STATE.unavailable
   if (Number.isInteger(error?.status) && ROUTING_REFUSAL_STATUS.has(error.status)) return STATE.unavailable
   /* 2026-10-28（用户点名「测了失败还显示可用」）：5xx / 超时 / 连接失败这类
