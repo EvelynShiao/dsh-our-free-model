@@ -328,12 +328,20 @@ export const BRIDGE_AGENT = 'mute2'
    mute2 会话注入 ~9600 字符 ≈ 2500-3200 token，探针一次的真实开销大头）。
    探针只需要「能生成一个字」的判定，零工具语义完全够用。 */
 export const PROBE_AGENT = 'mute3'
+/* 2026-11-01 探针再轻量化：mute3 自带超短 prompt——opencode 对没有自定义 prompt 的
+   agent 会注入它默认的 build 系统提示词（底座说明，实测 mute2 会话 in=1686~4260，
+   其中大半是底座+环境注入）。探针只需要「上游能生成任何文本」这一个信号，
+   一行 prompt 足矣。注意：agent 注册表只随服务启动装载，探针路径又绝不重启服务
+   （用户定案「探针只查不启」），所以这个 prompt 在服务下次重启/拉起时静默生效，
+   生效前探针行为不变（只是多花一点底座 token），无兼容风险。 */
+const PROBE_AGENT_PROMPT = 'Probe. Reply with exactly: pong'
 const PROBE_AGENT_CONFIG = {
   description: 'probe-only dumb pipe: zero tools, zero skills',
   mode: 'primary',
   tools: { '*': false },
   skills: false,
   permissions: [{ action: '*', resource: '*', effect: 'allow' }],
+  prompt: PROBE_AGENT_PROMPT,
 }
 
 /** mute2 的 agent 配置（写进用户 opencode.json 的形状）。 */
