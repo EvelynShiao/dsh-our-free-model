@@ -2045,9 +2045,16 @@ function createApiRoutes(deps) {
       }
       if (method === 'POST' && routePath === '/reprobe') {
         /* 2026-10-23：手动「立即探测」绕过 probeSkipFreeLane（用户点名要
-           手动控制权）——body.probeForceLane='free' 时 free 车道全量探测。 */
+           手动控制权）——body.probeForceLane='free' 时 free 车道全量探测。
+           2026-11-01（用户点名「不像修好了」）：手动探测传 autostart:true——
+           服务不在时自动探针只报灰字（「探针只查不启」定案只约束自动轮），
+           用户主动点按钮=授权拉起服务探真实可用性，否则按需模式下手动探测
+           与自动探测一样只见「未探测」，永远见不到真实状态。 */
         const body = await readJson(req).catch(() => ({}))
-        await deps.refreshAvailability(true, body?.probeForceLane === 'free' ? { probeForceLane: 'free' } : undefined)
+        await deps.refreshAvailability(true, {
+          ...(body?.probeForceLane === 'free' ? { probeForceLane: 'free' } : {}),
+          autostart: true,
+        })
         return send(200, { ok: true, ...buildSummary(deps) })
       }
       if (method === 'GET' && routePath === '/forward/key') {

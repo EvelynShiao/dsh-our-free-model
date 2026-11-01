@@ -39,7 +39,7 @@ export const BRIDGE_HINT =
 
 /** 服务没跑时的探针说明——按需启动模式下这是正常状态，不是故障。 */
 export const BRIDGE_IDLE_HINT =
-  '本机 opencode 服务未启动（按需启动：第一次用免费模型时自动拉起，约 0.5 秒；闲置后按设置自动退出）';
+  'opencode 服务未启动（按需模式的正常态）。直接选用免费模型即可自动拉起（约 0.5 秒）；设置页点「立即探测」也会拉起服务并探真实可用性';
 
 const UA_FALLBACK = 'opencode/latest/2.0.29/cli';
 

@@ -46,21 +46,24 @@ const PING_PROMPT = 'ping'
  * @param {string} [options.attributionUserAgent]
  * @param {AbortSignal} [options.signal]
  * @param {number} [options.timeoutMs]
+ * @param {boolean} [options.autostart] - 服务不在时是否拉起。自动轮保持 false
+ *   （「探针只查不启」定案）；手动「立即探测」传 true——用户主动点了按钮就是
+ *   授权拉起服务探真实可用性，否则按需模式下手动探测也只见灰字。
  * @returns {Promise<{state:string, detail?:string, latencyMs:number, ttftMs?:number}>}
  */
-export async function probeModel(model, { attributionUserAgent, signal, timeoutMs = 45000 } = {}) {
+export async function probeModel(model, { attributionUserAgent, signal, timeoutMs = 45000, autostart = false } = {}) {
   const started = Date.now()
   /* 2026-10-14：免费车道已被 OpenCode v2 门禁（伪造 session 一律 403），改走本地
      opencode 服务代发；探针必须走同一条道，否则界面上所有免费模型都会显示不可用。
-     2026-10-15：服务改成按需启动，探针**只查不启**（autostart:false）——否则 15 分钟
-     一轮的自动探测会把服务变回常驻，"平时不占内存"就白做了。服务没跑时报 unknown
-     （模型仍留在列表里：computeMembership 只排除 unavailable），详情写明首次使用会
-     自动拉起。 */
+     2026-10-15：服务改成按需启动，自动探针**只查不启**（autostart:false）——否则
+     15 分钟一轮的自动探测会把服务变回常驻，"平时不占内存"就白做了。服务没跑时报
+     unknown（模型仍留在列表里：computeMembership 只排除 unavailable），详情写明
+     首次使用会自动拉起。2026-11-01：手动探测路径可传 autostart:true。 */
   /* 2026-10-28：活性判定改用 ensureService({autostart:false})——它内部会真连端口。
      此前裸调 readService()，服务已停但 ~/.config/opencode/service.json 那份陈旧
      备胎（只有 password、没有 url）仍让它返回 127.0.0.1:4096，于是探针跳过
      「服务未启动」这条干净分支，去连一个死端口，把 idle 说明换成了连接错误。 */
-  const live = await ensureService({ autostart: false })
+  const live = await ensureService({ autostart: autostart === true })
   if (live === null) {
     return {
       state: STATE.unknown,
@@ -71,8 +74,9 @@ export async function probeModel(model, { attributionUserAgent, signal, timeoutM
   try {
     /* 2026-10-24 探针轻量化（用户点名「绕开不注入提示词」）：走 mute3——
        tools 全关 + skills 关，opencode 不再给探针会话注入 ~9600 字符的
-       工具/skill 说明书（那是探针 token 开销的大头）。只发一个 'ping'。 */
-    await bridgeGenerate({ modelId: model.id, prompt: 'ping', signal, autostart: false, agent: 'mute3' })
+       工具/skill 说明书（那是探针 token 开销的大头）。只发一个 'ping'。
+       2026-11-01：autostart 透传（手动探测拉起服务）。 */
+    await bridgeGenerate({ modelId: model.id, prompt: 'ping', signal, autostart: autostart === true, agent: 'mute3' })
     return { state: STATE.available, latencyMs: Date.now() - started }
   } catch (error) {
     /* 2026-10-28（用户点名「测了失败还显示可用」）：失败必须分类，不能再一律

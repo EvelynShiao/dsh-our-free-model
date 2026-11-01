@@ -271,7 +271,7 @@ export function createModelRuntime({
     const probeable = skipFree
       ? []
       : catalog.filter(entry => !isEacEntry(entry) && !isKiloEntry(entry) && !isAggregateEntry(entry) && !isComboEntry(entry))
-    const results = await probeCatalog(probeable, { attributionUserAgent, signal: lifetime.signal }, (id, result) => {
+    const results = await probeCatalog(probeable, { attributionUserAgent, signal: lifetime.signal, autostart: opts?.autostart === true }, (id, result) => {
       if (disposed) return
       availability.edit(value => ({
         ...value,
