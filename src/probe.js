@@ -65,8 +65,13 @@ export async function probeModel(model, { attributionUserAgent, signal, timeoutM
      「服务未启动」这条干净分支，去连一个死端口，把 idle 说明换成了连接错误。 */
   const live = await ensureService({ autostart: autostart === true })
   if (live === null) {
+    /* 2026-11-01（用户点名「throttled 却显示未探测」）：服务不在时这轮**没探成**，
+       不是「模型未知」。带 skipped 标记让调用方保留上一轮真实判定——额度红标、
+       地区墙都是持久事实，不该被「服务没起」的灰字冲掉；模型从未探过时才落
+       unknown（首探诚实显示未探测）。 */
     return {
       state: STATE.unknown,
+      skipped: true,
       detail: hasOpencodeCli() ? BRIDGE_IDLE_HINT : '本机未安装 opencode 客户端；免费车道需要它代发',
       latencyMs: Date.now() - started,
     }

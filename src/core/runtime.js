@@ -185,10 +185,17 @@ export function createModelRuntime({
     return catalog
   }
 
+  /* 2026-11-01（用户点名「EAC/Kilo 凭什么显示可用」）：这两条通道没有逐模型探针，
+     此前 UI 一律显示「可用」——listing 失败时也照旧，通道挂了照样绿。现在记录每条
+     通道最近一次名单轮的健康度，UI 据此显示「可用」（名单轮成功）或灰字「未探测」
+     （从未跑过/最近一轮失败）。 */
+  let laneHealth = { eac: null, kilo: null } // { ok: boolean, at } | null
+
   async function refreshSealedRoster() {
     const credential = sealedCredential()
     if (credential === null) {
       sealedCatalog = []
+      laneHealth.eac = null
       onSealedUnavailable()
       return
     }
@@ -199,6 +206,7 @@ export function createModelRuntime({
       if (Object.hasOwn(credential, 'userToken') && sealedCredential()?.userToken !== credential.userToken) return
       if (ids.length > 0) {
         sealedCatalog = buildEacCatalog(ids)
+        laneHealth.eac = { ok: true, at: Date.now() }
         catalogStore.update({ sealIds: sealedCatalog.map(entry => entry.id) })
       }
     } catch (error) {
@@ -206,10 +214,12 @@ export function createModelRuntime({
       if (Object.hasOwn(credential, 'userToken') && sealedCredential()?.userToken !== credential.userToken) return
       if (error?.code === CODE.credential) {
         sealedCatalog = []
+        laneHealth.eac = { ok: false, at: Date.now() }
         catalogStore.update({ sealIds: [] })
         logger.warn?.('our-free-model: the sealed lane refused its credential; its models are hidden until it is accepted again')
         return
       }
+      laneHealth.eac = { ok: false, at: Date.now() }
       logger.warn?.(`our-free-model: sealed lane listing failed (${error?.code ?? 'unknown'}); keeping its cached roster`)
     }
   }
@@ -229,9 +239,13 @@ export function createModelRuntime({
       if (disposed) return
       if (payload?.error || !Array.isArray(payload?.data)) throw new Error('invalid Kilo model listing')
       kiloCatalog = buildKiloCatalog(payload.data)
+      laneHealth.kilo = { ok: true, at: Date.now() }
       catalogStore.update({ kiloRows: kiloCatalog })
     } catch (error) {
-      if (!disposed) logger.warn?.(`our-free-model: Kilo channel listing failed (${error?.code ?? error?.message ?? 'unknown'}); keeping its cached roster`)
+      if (!disposed) {
+        laneHealth.kilo = { ok: false, at: Date.now() }
+        logger.warn?.(`our-free-model: Kilo channel listing failed (${error?.code ?? error?.message ?? 'unknown'}); keeping its cached roster`)
+      }
     }
   }
 
@@ -273,6 +287,11 @@ export function createModelRuntime({
       : catalog.filter(entry => !isEacEntry(entry) && !isKiloEntry(entry) && !isAggregateEntry(entry) && !isComboEntry(entry))
     const results = await probeCatalog(probeable, { attributionUserAgent, signal: lifetime.signal, autostart: opts?.autostart === true }, (id, result) => {
       if (disposed) return
+      /* 2026-11-01（用户点名「throttled 却显示未探测」）：服务不在的「未探成」轮
+         不得覆盖已有判定——按需模式下每 15 分钟一轮会把上一轮的额度红标/地区墙
+         冲成灰字（16:33 throttled 被 16:47 unknown 覆盖的实锤）。模型从没探过时
+         才第一次落 unknown。 */
+      if (result.skipped === true && availability.get().results?.[id] !== undefined) return
       availability.edit(value => ({
         ...value,
         results: {
@@ -307,7 +326,7 @@ export function createModelRuntime({
   async function refreshAvailability(force = false, opts = {}) {
     if (disposed || (!force && probeBackoffUntil > Date.now())) return {}
     if (probeRound !== null) return probeRound
-    const round = runProbeRound({ probeForceLane: opts?.probeForceLane })
+    const round = runProbeRound({ probeForceLane: opts?.probeForceLane, autostart: opts?.autostart === true })
     probeRound = round
     try { return await round } finally { if (probeRound === round) probeRound = null }
   }
@@ -331,6 +350,7 @@ export function createModelRuntime({
 
   return {
     state, adapter, refreshCatalog, refreshSealedLane, refreshAvailability, watchEgress, fetchListing,
+    laneHealth: () => ({ eac: laneHealth.eac, kilo: laneHealth.kilo }),
     complete: createForwardCompletion({ adapter, state, signal: lifetime.signal }),
     publicModelRows: () => publicModelRows(state()),
     // A settings write that changes the aggregate lane or the chains (a key

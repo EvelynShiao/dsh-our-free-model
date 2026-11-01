@@ -443,7 +443,7 @@ export function apply(ctx, config) {
     onSealedUnavailable: () => logger.warn?.('our-free-model: the sealed lane is not available in this composition (no recognized host profile); its models stay hidden'),
     onTopology: () => emitTopology(),
   })
-  const { state, adapter, refreshCatalog, refreshAvailability, watchEgress, fetchListing, publicModelRows, syncAggregateCatalog } = modelRuntime
+  const { state, adapter, refreshCatalog, refreshAvailability, watchEgress, fetchListing, publicModelRows, syncAggregateCatalog, laneHealth } = modelRuntime
   const runForwarded = modelRuntime.complete
 
   // ── registration ────────────────────────────────────────────────────────────
@@ -1083,6 +1083,7 @@ export function apply(ctx, config) {
   const api = createApiRoutes({
     settings, stats, availability, catalog: () => modelRuntime.catalog, state,
     refreshCatalog, refreshAvailability, syncForward, syncRelay, syncEgress,
+    laneHealth,
     pool: fetchPoolSnapshot,
     eacAuth,
     // ── the aggregate lane's settings surface ────────────────────────────────
@@ -2442,17 +2443,34 @@ function buildSummary(deps) {
   const update = deps.update.status()
   const feedView = deps.announcements.view()
   const defaultMaxTokens = deps.settings.get().defaultMaxTokens
-  // Lanes that carry no availability verdict of their own. The absorbed channels
-  // and the aggregate lane are named by a listing round that already succeeded,
-  // and a combo is a view over rows that were themselves named — none of them is
-  // pinged, so "no verdict" must not render as "unknown".
+  // Lanes that carry no per-model availability verdict. A combo is a view over
+  // rows that were themselves named; the aggregate lane is named by the settings
+  // themselves — neither is pinged, so "no verdict" must not render as "unknown".
+  // 2026-11-01（用户点名「EAC/Kilo 凭什么显示可用」）：EAC/Kilo 不再无条件显示
+  // 「可用」——按各自通道最近一次名单轮的健康度显示：成功=可用（通道级判定），
+  // 从未跑过或最近一轮失败=灰字「未探测」。诚实优先，不拿「列出来过」冒充探过。
   const unprobed = entry => isEacEntry(entry) || isKiloEntry(entry) || isAggregateEntry(entry) || isComboEntry(entry)
+  const lane = deps.laneHealth?.() ?? { eac: null, kilo: null }
+  const laneView = entry => {
+    const health = isEacEntry(entry) ? lane.eac : lane.kilo
+    const ok = health?.ok === true
+    return {
+      availability: ok ? STATE.available : STATE.unknown,
+      detail: ok ? '通道级判定：最近一次上游名单轮成功（未逐模型探测）' : '通道级：最近一次上游名单轮失败或尚未运行（未逐模型探测）',
+    }
+  }
   return {
     catalog: state.catalog.map(entry => ({
       ...entry,
-      availability: unprobed(entry) ? STATE.available : (snapshot.results?.[entry.id]?.state ?? STATE.unknown),
-      detail: unprobed(entry) ? '' : (snapshot.results?.[entry.id]?.detail ?? ''),
-      probedAt: unprobed(entry) ? 0 : (snapshot.results?.[entry.id]?.at ?? 0),
+      ...(unprobed(entry)
+        ? (isAggregateEntry(entry) || isComboEntry(entry))
+          ? { availability: STATE.available, detail: '', probedAt: 0 }
+          : { availability: laneView(entry).availability, detail: laneView(entry).detail, probedAt: 0 }
+        : {
+            availability: snapshot.results?.[entry.id]?.state ?? STATE.unknown,
+            detail: snapshot.results?.[entry.id]?.detail ?? '',
+            probedAt: snapshot.results?.[entry.id]?.at ?? 0,
+          }),
       ttftMs: unprobed(entry) ? undefined : snapshot.results?.[entry.id]?.ttftMs,
       latencyMs: unprobed(entry) ? undefined : snapshot.results?.[entry.id]?.latencyMs,
       // What each rung of the effort menu will really put on the wire for this
