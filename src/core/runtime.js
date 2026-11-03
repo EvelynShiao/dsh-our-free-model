@@ -266,26 +266,37 @@ export function createModelRuntime({
   let probeThrottleStreak = 0
   let probeBackoffUntil = 0
   async function runProbeRound(opts = {}) {
-    // The absorbed channels get no per-model probes: their verdicts would be
-    // spent against a different gateway than the one that serves them, and a
-    // roster the listing named is advertised as-is (its health is the listing
-    // round's, refreshed on the same cadence). The aggregate lane is excluded
-    // for a sharper reason — a probe there is a *real request to a provider the
-    // user pays for*, spent to learn something the settings page already knows
-    // (whether a key is configured). A combo is excluded because it has no
-    // endpoint of its own: probing one would send the chain's own id to the free
-    // lane as a model name, spending quota to collect a verdict about nothing.
+    // The aggregate lane is excluded for a sharp reason — a probe there is a
+    // *real request to a provider the user pays for*, spent to learn something
+    // the settings page already knows (whether a key is configured). A combo is
+    // excluded because it has no endpoint of its own: probing one would send
+    // the chain's own id to the free lane as a model name, spending quota to
+    // collect a verdict about nothing.
     /* 2026-10-23 探针手动控制（用户点名）：probeSkipFreeLane=true 时自动探测
        跳过 free 车道全部模型——free 车道的探针是真实生成请求（bridgeGenerate
        'ping' 或上游 ping 流），15 分钟一轮×N 模型把 IP 匿名额度烧穿是主因。
        EAC/kilo 探针（登录态/无凭证池）不受此开关影响；「立即探测」手动路径
        传 probeForceLane:'free' 仍可全量探。catalog 刷新照常，被跳过的模型
        徽章维持上次判定或 unknown。 */
+    /* 2026-11-03（用户定案「没探测就写未探测，探测了再说可不可以用」）：EAC/Kilo
+       纳入逐模型真实探针，通道级「名单轮成功=可用」废除。范围：自动轮只探选择页
+       可见的通道模型（hiddenModels/visibleModels 过滤，语义与 adapter.listModels
+       一致——隐藏的不烧真实请求）；手动「立即探测」传 laneProbeAll 全量（用户要
+       完整测速数据再定白名单）。探针直连各自上游不过 opencode 桥，服务不在照探；
+       EAC 未解锁由探针报 skipped（保留旧判定）。 */
     const skipFree = settings.get().probeSkipFreeLane === true && opts?.probeForceLane !== 'free'
-    const probeable = skipFree
+    const snapshot = settings.get()
+    const hidden = new Set(Array.isArray(snapshot.hiddenModels) ? snapshot.hiddenModels : [])
+    const visible = Array.isArray(snapshot.visibleModels) ? new Set(snapshot.visibleModels) : null
+    const laneVisible = entry => !hidden.has(entry.id) && (visible === null || visible.has(entry.id))
+    const freeProbeable = skipFree
       ? []
       : catalog.filter(entry => !isEacEntry(entry) && !isKiloEntry(entry) && !isAggregateEntry(entry) && !isComboEntry(entry))
-    const results = await probeCatalog(probeable, { attributionUserAgent, signal: lifetime.signal, autostart: opts?.autostart === true }, (id, result) => {
+    const laneProbeable = opts?.laneProbeAll === true
+      ? catalog.filter(entry => isEacEntry(entry) || isKiloEntry(entry))
+      : catalog.filter(entry => (isEacEntry(entry) || isKiloEntry(entry)) && laneVisible(entry))
+    const probeable = [...freeProbeable, ...laneProbeable]
+    const results = await probeCatalog(probeable, { attributionUserAgent, signal: lifetime.signal, autostart: opts?.autostart === true, sealedCredential }, (id, result) => {
       if (disposed) return
       /* 2026-11-01（用户点名「throttled 却显示未探测」）：服务不在的「未探成」轮
          不得覆盖已有判定——按需模式下每 15 分钟一轮会把上一轮的额度红标/地区墙
@@ -326,7 +337,13 @@ export function createModelRuntime({
   async function refreshAvailability(force = false, opts = {}) {
     if (disposed || (!force && probeBackoffUntil > Date.now())) return {}
     if (probeRound !== null) return probeRound
-    const round = runProbeRound({ probeForceLane: opts?.probeForceLane, autostart: opts?.autostart === true })
+    /* 2026-11-03：laneProbeAll 透传——手动「立即探测」全量探 EAC/Kilo（含隐藏），
+       自动轮只探可见的。 */
+    const round = runProbeRound({
+      probeForceLane: opts?.probeForceLane,
+      autostart: opts?.autostart === true,
+      laneProbeAll: opts?.laneProbeAll === true,
+    })
     probeRound = round
     try { return await round } finally { if (probeRound === round) probeRound = null }
   }

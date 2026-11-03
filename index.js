@@ -2050,11 +2050,14 @@ function createApiRoutes(deps) {
            2026-11-01（用户点名「不像修好了」）：手动探测传 autostart:true——
            服务不在时自动探针只报灰字（「探针只查不启」定案只约束自动轮），
            用户主动点按钮=授权拉起服务探真实可用性，否则按需模式下手动探测
-           与自动探测一样只见「未探测」，永远见不到真实状态。 */
+           与自动探测一样只见「未探测」，永远见不到真实状态。
+           2026-11-03：laneProbeAll——手动全量探 EAC/Kilo（含隐藏模型，用户
+           要完整测速数据再定显隐白名单）；自动轮只探选择页可见的通道模型。 */
         const body = await readJson(req).catch(() => ({}))
         await deps.refreshAvailability(true, {
           ...(body?.probeForceLane === 'free' ? { probeForceLane: 'free' } : {}),
           autostart: true,
+          laneProbeAll: true,
         })
         return send(200, { ok: true, ...buildSummary(deps) })
       }
@@ -2446,26 +2449,17 @@ function buildSummary(deps) {
   // Lanes that carry no per-model availability verdict. A combo is a view over
   // rows that were themselves named; the aggregate lane is named by the settings
   // themselves — neither is pinged, so "no verdict" must not render as "unknown".
-  // 2026-11-01（用户点名「EAC/Kilo 凭什么显示可用」）：EAC/Kilo 不再无条件显示
-  // 「可用」——按各自通道最近一次名单轮的健康度显示：成功=可用（通道级判定），
-  // 从未跑过或最近一轮失败=灰字「未探测」。诚实优先，不拿「列出来过」冒充探过。
-  const unprobed = entry => isEacEntry(entry) || isKiloEntry(entry) || isAggregateEntry(entry) || isComboEntry(entry)
-  const lane = deps.laneHealth?.() ?? { eac: null, kilo: null }
-  const laneView = entry => {
-    const health = isEacEntry(entry) ? lane.eac : lane.kilo
-    const ok = health?.ok === true
-    return {
-      availability: ok ? STATE.available : STATE.unknown,
-      detail: ok ? '通道级判定：最近一次上游名单轮成功（未逐模型探测）' : '通道级：最近一次上游名单轮失败或尚未运行（未逐模型探测）',
-    }
-  }
+  /* 2026-11-03（用户定案「没探测就写未探测，探测了再说可不可以用」）：EAC/Kilo 的
+     通道级「名单轮成功=可用」废除——名单成功≠能用，且名单接口几乎从不失败，
+     徽章常年绿等于没判。两条通道已纳入逐模型真实探针（probe.probeChannelModel），
+     与其他模型一样走 snapshot.results：没探过=灰字「未探测」，探过=真实判定
+     （含 ttft/latency 测速）。laneHealth 不再参与显示，仅在 runtime 内部维护。 */
+  const unprobed = entry => isAggregateEntry(entry) || isComboEntry(entry)
   return {
     catalog: state.catalog.map(entry => ({
       ...entry,
       ...(unprobed(entry)
-        ? (isAggregateEntry(entry) || isComboEntry(entry))
-          ? { availability: STATE.available, detail: '', probedAt: 0 }
-          : { availability: laneView(entry).availability, detail: laneView(entry).detail, probedAt: 0 }
+        ? { availability: STATE.available, detail: '', probedAt: 0 }
         : {
             availability: snapshot.results?.[entry.id]?.state ?? STATE.unknown,
             detail: snapshot.results?.[entry.id]?.detail ?? '',

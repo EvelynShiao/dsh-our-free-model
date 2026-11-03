@@ -19,6 +19,10 @@ import { CODE, postStreamed } from './http.js'
 import { egressFetch } from './egress.js'
 /* 2026-10-14：免费车道改走本地 opencode 服务代发（OpenCode v2 门禁后唯一合法通道）。 */
 import { bridgeGenerate, readService, ensureService, hasOpencodeCli, BRIDGE_IDLE_HINT } from './opencode-bridge.js'
+/* 2026-11-03（用户定案）：EAC/Kilo 逐模型真实探针——两条通道直连各自上游的
+   OpenAI 兼容 /chat/completions，不过 opencode 桥，探针天然零注入。 */
+import { postSealedStreamed } from './eac.js'
+import { postKiloStreamed } from './kilo.js'
 
 /** Public-echo sources, tried in order; any one answering is enough. */
 const ECHO_SOURCES = [
@@ -38,6 +42,106 @@ export const STATE = {
 
 const PING_PROMPT = 'ping'
 
+/* 2026-11-03（用户定案）：EAC/Kilo 通道探针的零注入单句——无 system、无 tools，
+   messages 仅此一条 user。判定看模型是否正常应答（「是否中了」），应答预览写进
+   detail 供用户核验。 */
+const LANE_PING_PROMPT = "请回答'你好'，不要附带其他任何文字"
+
+/**
+ * Ask one EAC/Kilo model, once, over its own wire.
+ *
+ * 2026-11-03（用户定案「没探测就写未探测，探测了再说可不可以用」）：通道级
+ * 「名单轮成功=可用」被推翻——名单成功≠能用。探针走各自真实 completion 链路
+ * （EAC postSealedStreamed、Kilo postKiloStreamed），零注入单句，应答预览进
+ * detail。EAC 未解锁（credential null）时报 skipped：本轮没探成，调用方保留
+ * 上一轮真实判定，首探才落 unknown。分类沿用 stateOf（两条通道的 classifier
+ * 产出同族 code/status）。
+ *
+ * @param {object} model - catalog entry（channel: 'eac' | 'kilo'）
+ * @param {object} options
+ * @param {AbortSignal} [options.signal]
+ * @param {number} [options.timeoutMs]
+ * @param {() => object|null|Promise<object|null>} [options.sealedCredential] - EAC 解锁
+ * @returns {Promise<{state:string, detail?:string, latencyMs:number, ttftMs?:number, skipped?:boolean}>}
+ */
+export async function probeChannelModel(model, { signal, timeoutMs = 60000, sealedCredential } = {}) {
+  const started = Date.now()
+  const isEac = model?.channel === 'eac'
+  let credential = null
+  if (isEac) {
+    credential = await Promise.resolve(sealedCredential?.())
+    if (credential === null || credential === undefined) {
+      return {
+        state: STATE.unknown,
+        skipped: true,
+        detail: 'EAC 通道未解锁（未登录或宿主未提供配置），本轮未探成',
+        latencyMs: Date.now() - started,
+      }
+    }
+  }
+  /* max_tokens=512：reasoning 通道思考占预算，16 会零正文；512 让「你好」稳定
+     出得来，又不至于探一次烧掉一大截。 */
+  const body = { model: model.id, messages: [{ role: 'user', content: LANE_PING_PROMPT }], stream: true, max_tokens: 512 }
+  let firstDelta
+  let streamError
+  let answerText = ''
+  const onData = payload => {
+    // 200 流内的拒绝帧（{"error":…}）：与 free 车道同款识别——只看「有没有 delta」
+    // 会把拒答流记成可用（src/http.js 同一纪律）。
+    if (streamError === undefined && /"(?:type"\s*:\s*"error"|"error"\s*:)/.test(payload)) {
+      try {
+        const parsed = JSON.parse(payload)
+        const failure = parsed?.error ?? (parsed?.type === 'error' ? parsed : undefined)
+        if (failure !== undefined && failure !== null) {
+          streamError = typeof failure.message === 'string' ? failure.message : 'upstream error'
+          return
+        }
+      } catch { /* 非 JSON 帧；下方 delta 解析照跑 */ }
+    }
+    if (firstDelta === undefined) firstDelta = Date.now()
+    try {
+      const parsed = JSON.parse(payload)
+      const delta = parsed?.choices?.[0]?.delta ?? parsed?.choices?.[0]?.message ?? null
+      answerText += typeof delta?.content === 'string' ? delta.content
+        : typeof delta?.reasoning_content === 'string' ? delta.reasoning_content
+        : typeof delta?.reasoning === 'string' ? delta.reasoning
+        : ''
+    } catch { /* usage/finish 等非增量帧 */ }
+  }
+  try {
+    const posted = isEac
+      ? postSealedStreamed({ credential, body, signal, onData, timeoutMs })
+      : postKiloStreamed({ body, signal, onData, timeoutMs })
+    await posted
+    if (streamError !== undefined) {
+      return { state: stateOf({ message: streamError }), detail: streamError.slice(0, 200), latencyMs: Date.now() - started }
+    }
+    const preview = answerText.replace(/\s+/g, ' ').trim().slice(0, 60)
+    if (preview === '') {
+      /* 流正常结束但零输出（reasoning 预算耗尽/上游空转）：没探成，诚实记
+         unknown——不给绿标。 */
+      return {
+        state: STATE.unknown,
+        detail: '流正常结束但模型零输出（可能思考预算耗尽）',
+        latencyMs: Date.now() - started,
+        ttftMs: firstDelta === undefined ? undefined : firstDelta - started,
+      }
+    }
+    return {
+      state: STATE.available,
+      detail: `${/你好/.test(answerText) ? '应答正确' : '应答偏题'}：${preview}`,
+      latencyMs: Date.now() - started,
+      ttftMs: firstDelta === undefined ? undefined : firstDelta - started,
+    }
+  } catch (error) {
+    return {
+      state: stateOf(error),
+      detail: typeof error?.message === 'string' ? error.message.slice(0, 200) : String(error),
+      latencyMs: Date.now() - started,
+    }
+  }
+}
+
 /**
  * Ask the gateway for one model, once.
  *
@@ -51,8 +155,13 @@ const PING_PROMPT = 'ping'
  *   授权拉起服务探真实可用性，否则按需模式下手动探测也只见灰字。
  * @returns {Promise<{state:string, detail?:string, latencyMs:number, ttftMs?:number}>}
  */
-export async function probeModel(model, { attributionUserAgent, signal, timeoutMs = 45000, autostart = false } = {}) {
+export async function probeModel(model, { attributionUserAgent, signal, timeoutMs = 45000, autostart = false, sealedCredential } = {}) {
   const started = Date.now()
+  /* 2026-11-03（用户定案）：EAC/Kilo 不再被探针排除——走各自直连链路逐模型真实
+     探测。探针不经过 opencode 桥，服务不在照探；EAC 未解锁由探针自己报 skipped。 */
+  if (model?.channel === 'eac' || model?.channel === 'kilo') {
+    return probeChannelModel(model, { signal, timeoutMs, sealedCredential })
+  }
   /* 2026-10-14：免费车道已被 OpenCode v2 门禁（伪造 session 一律 403），改走本地
      opencode 服务代发；探针必须走同一条道，否则界面上所有免费模型都会显示不可用。
      2026-10-15：服务改成按需启动，自动探针**只查不启**（autostart:false）——否则
