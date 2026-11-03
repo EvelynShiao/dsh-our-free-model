@@ -91,7 +91,11 @@ export async function probeChannelModel(model, { signal, timeoutMs = 60000, seal
   const onData = payload => {
     // 200 流内的拒绝帧（{"error":…}）：与 free 车道同款识别——只看「有没有 delta」
     // 会把拒答流记成可用（src/http.js 同一纪律）。
-    if (streamError === undefined && /"(?:type"\s*:\s*"error"|"error"\s*:)/.test(payload)) {
+    /* 2026-11-03 实锤修BUG：原正则 /"(?:type"\s*:\s*"error"|"error"\s*:)/ 的分支2
+       被外层引号污染，实际要求文本出现 `""error":`（双引号连写）——正常 JSON
+       永不命中，EAC 的 {"error":{...}} 错误帧（free 池额度/链路故障全走这形状）
+       因此被当普通帧漏掉，探针看到「0 帧 / 零输出」。拆成两个独立分支。 */
+    if (streamError === undefined && /"type"\s*:\s*"error"|"error"\s*:/.test(payload)) {
       try {
         const parsed = JSON.parse(payload)
         const failure = parsed?.error ?? (parsed?.type === 'error' ? parsed : undefined)
@@ -237,7 +241,11 @@ export async function probeModel(model, { attributionUserAgent, signal, timeoutM
         // Reading only "did a delta look like a delta" called such a stream
         // available, and a model that fails every honest turn sat in the picker
         // with a green badge.
-        if (streamError === undefined && /"(?:type"\s*:\s*"error"|"error"\s*:)/.test(payload)) {
+        /* 2026-11-03 实锤修BUG：原正则 /"(?:type"\s*:\s*"error"|"error"\s*:)/ 的分支2
+       被外层引号污染，实际要求文本出现 `""error":`（双引号连写）——正常 JSON
+       永不命中，EAC 的 {"error":{...}} 错误帧（free 池额度/链路故障全走这形状）
+       因此被当普通帧漏掉，探针看到「0 帧 / 零输出」。拆成两个独立分支。 */
+    if (streamError === undefined && /"type"\s*:\s*"error"|"error"\s*:/.test(payload)) {
           try {
             const parsed = JSON.parse(payload)
             const failure = parsed?.error ?? (parsed?.type === 'error' ? parsed : undefined)
