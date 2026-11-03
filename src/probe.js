@@ -334,8 +334,10 @@ function stateOf(error) {
   if (/not available in your country/i.test(message)) return STATE.regionBlocked
   /* 2026-11-03：额度墙——EAC free 池的 "Free usage limit reached" 走 200 SSE
      裸 JSON 行（无 HTTP status 可判），按文本认出；与 zen 车道同款错误的 503
-     路径（gatewayTrouble）同判 throttled 红标保留自愈。 */
-  if (/free usage limit|usage limit reached/i.test(message)) return STATE.throttled
+     路径（gatewayTrouble）同判 throttled 红标保留自愈。同通道的
+     "do request failed"（new_api 网关上游链路故障，实测同在裸行里）同理——
+     网关的麻烦不是模型的判决。 */
+  if (/free usage limit|usage limit reached|do request failed/i.test(message)) return STATE.throttled
   /* 2026-10-28：上游点名「这个模型不给你」的措辞，明确到足以摘牌，且不受 5xx
      guard 约束——EAC 对退役模型报 "reached its end of life"（装在 HTTP 200 的
      SSE 流里），对坏路由报 "Function … Not found for account"（账户级配置缺失）；
