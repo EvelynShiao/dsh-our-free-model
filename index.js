@@ -2051,13 +2051,12 @@ function createApiRoutes(deps) {
            服务不在时自动探针只报灰字（「探针只查不启」定案只约束自动轮），
            用户主动点按钮=授权拉起服务探真实可用性，否则按需模式下手动探测
            与自动探测一样只见「未探测」，永远见不到真实状态。
-           2026-11-03：laneProbeAll——手动全量探 EAC/Kilo（含隐藏模型，用户
-           要完整测速数据再定显隐白名单）；自动轮只探选择页可见的通道模型。 */
+           2026-11-03：EAC/Kilo 自动轮与手动轮同为全量（用户定案「不可见的
+           何必不探测」），无需 laneProbeAll 区分。 */
         const body = await readJson(req).catch(() => ({}))
         await deps.refreshAvailability(true, {
           ...(body?.probeForceLane === 'free' ? { probeForceLane: 'free' } : {}),
           autostart: true,
-          laneProbeAll: true,
         })
         return send(200, { ok: true, ...buildSummary(deps) })
       }
@@ -2466,6 +2465,7 @@ function buildSummary(deps) {
             probedAt: snapshot.results?.[entry.id]?.at ?? 0,
           }),
       ttftMs: unprobed(entry) ? undefined : snapshot.results?.[entry.id]?.ttftMs,
+      tps: unprobed(entry) ? undefined : snapshot.results?.[entry.id]?.tps,
       latencyMs: unprobed(entry) ? undefined : snapshot.results?.[entry.id]?.latencyMs,
       // What each rung of the effort menu will really put on the wire for this
       // model, so the page never shows a 32K "output ceiling" beside a call that

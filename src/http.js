@@ -489,7 +489,16 @@ function emit(line, onData) {
     const payload = text.slice(5).trim()
     if (payload === '' || payload === '[DONE]') return
     onData(payload)
+    return
   }
+  /* 2026-11-03（EAC 实锤）：上游会把错误放在裸 JSON 行——不带 data: 前缀，
+     前面只有 ": channel open" 注释行（EAC free 池额度耗尽时实测：
+     `{"error":{"message":"Free usage limit reached...",...}}`）。此前被这里
+     静默丢弃：探针看到「0 帧正常结束」，真实聊天空转到超时，额度错误完全
+     无感。裸 JSON 行按 data 帧等价物投给 onData——两端的 error 帧检测
+     （probe 的 streamError、stream.js 的真实轮分类）都能接住。event:/id:
+     等合法 SSE 字段行不以 { [ 开头，不会误投。 */
+  if (text.startsWith('{') || text.startsWith('[')) onData(text)
 }
 
 /** Fetch a small JSON document from the gateway with the fingerprint headers. */

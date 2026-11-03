@@ -80,11 +80,14 @@ export async function probeChannelModel(model, { signal, timeoutMs = 60000, seal
     }
   }
   /* max_tokens=512：reasoning 通道思考占预算，16 会零正文；512 让「你好」稳定
-     出得来，又不至于探一次烧掉一大截。 */
+     出得来，又不至于探一次烧掉一大截。两通道流式末帧均自带 usage
+     （completion_tokens），tps = 输出 tokens / 生成时长（首帧→末 delta 帧）。 */
   const body = { model: model.id, messages: [{ role: 'user', content: LANE_PING_PROMPT }], stream: true, max_tokens: 512 }
   let firstDelta
+  let lastDelta
   let streamError
   let answerText = ''
+  let completionTokens
   const onData = payload => {
     // 200 流内的拒绝帧（{"error":…}）：与 free 车道同款识别——只看「有没有 delta」
     // 会把拒答流记成可用（src/http.js 同一纪律）。
@@ -101,11 +104,13 @@ export async function probeChannelModel(model, { signal, timeoutMs = 60000, seal
     if (firstDelta === undefined) firstDelta = Date.now()
     try {
       const parsed = JSON.parse(payload)
+      if (Number.isFinite(parsed?.usage?.completion_tokens)) completionTokens = parsed.usage.completion_tokens
       const delta = parsed?.choices?.[0]?.delta ?? parsed?.choices?.[0]?.message ?? null
-      answerText += typeof delta?.content === 'string' ? delta.content
+      const piece = typeof delta?.content === 'string' ? delta.content
         : typeof delta?.reasoning_content === 'string' ? delta.reasoning_content
         : typeof delta?.reasoning === 'string' ? delta.reasoning
-        : ''
+        : null
+      if (piece !== null) { answerText += piece; lastDelta = Date.now() }
     } catch { /* usage/finish 等非增量帧 */ }
   }
   try {
@@ -127,11 +132,17 @@ export async function probeChannelModel(model, { signal, timeoutMs = 60000, seal
         ttftMs: firstDelta === undefined ? undefined : firstDelta - started,
       }
     }
+    /* tps：usage 的 completion_tokens / 生成时长（首帧→末 delta 帧）。缺 usage
+       或时长为 0 时不给数（不猜）。 */
+    const tps = Number.isFinite(completionTokens) && Number.isFinite(lastDelta) && Number.isFinite(firstDelta) && lastDelta > firstDelta
+      ? Math.round(completionTokens / ((lastDelta - firstDelta) / 1000) * 10) / 10
+      : undefined
     return {
       state: STATE.available,
       detail: `${/你好/.test(answerText) ? '应答正确' : '应答偏题'}：${preview}`,
       latencyMs: Date.now() - started,
       ttftMs: firstDelta === undefined ? undefined : firstDelta - started,
+      ...tps === undefined ? {} : { tps },
     }
   } catch (error) {
     return {
@@ -321,6 +332,10 @@ function stateOf(error) {
   /* 2026-10-31：地区墙先行——bridge 抛的错没有 code，opencode 对地区外模型在
      503 体里说 "This model is not available in your country"，只有这里能认出。 */
   if (/not available in your country/i.test(message)) return STATE.regionBlocked
+  /* 2026-11-03：额度墙——EAC free 池的 "Free usage limit reached" 走 200 SSE
+     裸 JSON 行（无 HTTP status 可判），按文本认出；与 zen 车道同款错误的 503
+     路径（gatewayTrouble）同判 throttled 红标保留自愈。 */
+  if (/free usage limit|usage limit reached/i.test(message)) return STATE.throttled
   /* 2026-10-28：上游点名「这个模型不给你」的措辞，明确到足以摘牌，且不受 5xx
      guard 约束——EAC 对退役模型报 "reached its end of life"（装在 HTTP 200 的
      SSE 流里），对坏路由报 "Function … Not found for account"（账户级配置缺失）；

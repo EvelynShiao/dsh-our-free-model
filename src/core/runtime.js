@@ -278,23 +278,16 @@ export function createModelRuntime({
        EAC/kilo 探针（登录态/无凭证池）不受此开关影响；「立即探测」手动路径
        传 probeForceLane:'free' 仍可全量探。catalog 刷新照常，被跳过的模型
        徽章维持上次判定或 unknown。 */
-    /* 2026-11-03（用户定案「没探测就写未探测，探测了再说可不可以用」）：EAC/Kilo
-       纳入逐模型真实探针，通道级「名单轮成功=可用」废除。范围：自动轮只探选择页
-       可见的通道模型（hiddenModels/visibleModels 过滤，语义与 adapter.listModels
-       一致——隐藏的不烧真实请求）；手动「立即探测」传 laneProbeAll 全量（用户要
-       完整测速数据再定白名单）。探针直连各自上游不过 opencode 桥，服务不在照探；
-       EAC 未解锁由探针报 skipped（保留旧判定）。 */
+    /* 2026-11-03（用户定案「没探测就写未探测，探测了再说可不可以用」+「不可见的
+       何必不探测，万一变好了怎么知道」）：EAC/Kilo 纳入逐模型真实探针且**全量**，
+       不按显隐白名单过滤——显隐只管显示，隐藏模型的判定照常更新，变好了徽章自己
+       转绿。探针直连各自上游不过 opencode 桥，服务不在照探；EAC 未解锁由探针报
+       skipped（保留旧判定）。probeSkipFreeLane 仍只管 free 车道（原定案不变）。 */
     const skipFree = settings.get().probeSkipFreeLane === true && opts?.probeForceLane !== 'free'
-    const snapshot = settings.get()
-    const hidden = new Set(Array.isArray(snapshot.hiddenModels) ? snapshot.hiddenModels : [])
-    const visible = Array.isArray(snapshot.visibleModels) ? new Set(snapshot.visibleModels) : null
-    const laneVisible = entry => !hidden.has(entry.id) && (visible === null || visible.has(entry.id))
     const freeProbeable = skipFree
       ? []
       : catalog.filter(entry => !isEacEntry(entry) && !isKiloEntry(entry) && !isAggregateEntry(entry) && !isComboEntry(entry))
-    const laneProbeable = opts?.laneProbeAll === true
-      ? catalog.filter(entry => isEacEntry(entry) || isKiloEntry(entry))
-      : catalog.filter(entry => (isEacEntry(entry) || isKiloEntry(entry)) && laneVisible(entry))
+    const laneProbeable = catalog.filter(entry => isEacEntry(entry) || isKiloEntry(entry))
     const probeable = [...freeProbeable, ...laneProbeable]
     const results = await probeCatalog(probeable, { attributionUserAgent, signal: lifetime.signal, autostart: opts?.autostart === true, sealedCredential }, (id, result) => {
       if (disposed) return
@@ -311,6 +304,7 @@ export function createModelRuntime({
             state: result.state,
             ...result.detail === undefined ? {} : { detail: result.detail },
             ...result.ttftMs === undefined ? {} : { ttftMs: result.ttftMs },
+            ...result.tps === undefined ? {} : { tps: result.tps },
             latencyMs: result.latencyMs, at: Date.now(),
           },
         },
@@ -337,13 +331,9 @@ export function createModelRuntime({
   async function refreshAvailability(force = false, opts = {}) {
     if (disposed || (!force && probeBackoffUntil > Date.now())) return {}
     if (probeRound !== null) return probeRound
-    /* 2026-11-03：laneProbeAll 透传——手动「立即探测」全量探 EAC/Kilo（含隐藏），
-       自动轮只探可见的。 */
-    const round = runProbeRound({
-      probeForceLane: opts?.probeForceLane,
-      autostart: opts?.autostart === true,
-      laneProbeAll: opts?.laneProbeAll === true,
-    })
+    /* 2026-11-03：EAC/Kilo 自动轮与手动轮同为全量（用户定案「不可见的何必不探测」），
+       laneProbeAll 不再需要区分。 */
+    const round = runProbeRound({ probeForceLane: opts?.probeForceLane, autostart: opts?.autostart === true })
     probeRound = round
     try { return await round } finally { if (probeRound === round) probeRound = null }
   }
