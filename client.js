@@ -2804,7 +2804,10 @@ window.__ModuleLoader__.load({
       // 暂不可用的模型不再单独成组展示（用户要求移除「不在选择器中」区块）：
       // 它们的状态仍在上方统计芯片与每张卡的徽章里如实可见。
       /* 探针手动控制（2026-10-23 用户点名）：跳过 free 车道自动探测 + 探测间隔
-         分钟数可改，都在模型清单顶部直接操作，不用进设置页。 */
+         分钟数可改，都在模型清单顶部直接操作，不用进设置页。
+         2026-11-03（用户定案「我这个免费车道都要探测的」）：开关描述如实标注
+         管辖范围——EAC/Kilo 已是逐模型真实探针且恒全量（f87e1f0），本开关只控
+         zen 免费车道；默认关闭（全车道探测）。 */
       const probeInterval = Number(summary.settings?.probeIntervalMinutes ?? 15)
       const probeSkip = summary.settings?.probeSkipFreeLane === true
       const [probeIntervalDraft, setProbeIntervalDraft] = useState(probeInterval)
@@ -2816,7 +2819,7 @@ window.__ModuleLoader__.load({
       }
       return h(Fragment, null,
         h('div', { className: 'ofm_row', style: { gap: 8, flexWrap: 'wrap', marginBottom: 8 } },
-          h(Switch, { checked: probeSkip, label: '自动探测：跳过免费车道（省 IP 匿名额度）', onChange: () => void setProbeOpt({ probeSkipFreeLane: !probeSkip }) }),
+          h(Switch, { checked: probeSkip, label: '自动探测跳过 zen 免费车道（EAC/Kilo 恒全量探测，不受此开关影响）', onChange: () => void setProbeOpt({ probeSkipFreeLane: !probeSkip }) }),
           h('span', { className: 'ofm_pill' }, '探测间隔（分钟）'),
           h('input', { className: 'ofm_input', style: { maxWidth: 80 }, value: probeIntervalDraft,
             onChange: e => setProbeIntervalDraft(Number(e.target.value.replace(/[^0-9]/g, '')) || 0) }),
