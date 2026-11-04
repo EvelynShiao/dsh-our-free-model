@@ -458,7 +458,9 @@ export function apply(ctx, config) {
   // all must not be addable to a profile just because it still appears in the
   // upstream listing.
   ctx.llm.registerModelDiscovery?.(ctx.fiber?.entry?.options?.id ?? name, async () => {
-    await refreshCatalog({ probe: true, force: true })
+    // 探测间隔=0（2026-11-04 用户定案）→ 宿主发现模型也不触发探针轮（探针是
+    // 真实请求，会烧 opencode 免费额度），只刷名单。
+    await refreshCatalog({ probe: Number(settings.get().probeIntervalMinutes) > 0, force: true })
     const advertised = new Set(Object.values(state().membership).flat())
     return modelRuntime.catalog
       .filter(entry => advertised.has(entry.id))
@@ -1543,7 +1545,8 @@ export function apply(ctx, config) {
       // topology event and the upgrade marker below down with it, reported as
       // a single "startup refresh failed" line.
       try {
-        await refreshCatalog({ probe: true, force: true })
+        // 探测间隔=0（2026-11-04 用户定案）→ 启动不跑探针轮（烧免费额度），只刷名单
+        await refreshCatalog({ probe: Number(settings.get().probeIntervalMinutes) > 0, force: true })
       } catch (error) {
         logger.warn?.(`our-free-model: startup refresh failed (${error?.message ?? error})`)
       }
@@ -1604,10 +1607,16 @@ export function apply(ctx, config) {
   // a negative one would otherwise spin. This used to read `Math.max(60, …)`,
   // which floored every interval below an hour *including the shipped default of
   // 15*, so the number on the settings page was silently ignored.
+  // 探测间隔=0（2026-11-04 用户定案「探测间隔=0 就是不探测」）→ 停跑自动探针，
+  // 只保留手动「立即探测」。动机：探针是真实上游请求，zen/EAC 免费池背后是
+  // opencode 免费层（按次计，约 200 请求/天，登录/充值不解锁——issue #33495
+  // 实锤付费用户也撞墙），15 分钟全量轮每天 1000+ 请求远超上限——窗口重置
+  // 即被探针烧穿，真实聊天永远 503。catalog 名单轮照常（纯 GET 不烧额度，
+  // 名单仍跟随上游）；timer 周期不变（0 时按 15 分钟空转，只刷名单不探测）。
   every(() => {
     void (async () => {
       await watchEgress()
-      await refreshCatalog({ probe: true })
+      await refreshCatalog({ probe: Number(settings.get().probeIntervalMinutes) > 0 })
     })().catch(error => logger.warn?.(`our-free-model: periodic refresh failed (${error?.message ?? error})`))
   }, () => positiveOr(settings.get().probeIntervalMinutes, 15, 1) * 60_000)
   // A failing egress watch means the network is down, which is worth one line —
@@ -1693,7 +1702,15 @@ function sanitizeSettings(patch, current) {
     const value = Number(next[key])
     next[key] = Number.isFinite(value) && value > 0 ? Math.trunc(value) : (Number(current[key]) || fallback)
   }
-  positive('probeIntervalMinutes', 15)
+  // probeIntervalMinutes=0 是有效答案（2026-11-04 用户定案「探测间隔=0 就是不
+  // 探测」）：不能用 positive()——它把 0 当「没填」回落 15，设置页保存任何一项
+  // 都会把 0 冲回 15，探针复活继续烧 opencode 免费额度。
+  if (next.probeIntervalMinutes !== undefined) {
+    const value = Number(next.probeIntervalMinutes)
+    next.probeIntervalMinutes = Number.isFinite(value) && value >= 0
+      ? Math.trunc(value)
+      : (Number(current.probeIntervalMinutes) || 15)
+  }
   positive('feedPollMinutes', 30)
   // 0 是有效答案：跟随模型自身输出上限（2026-10-15）。与 updateCheckHours 同理，
   // 不能把 0 当成「用户没填」而回落到一个固定上限。
