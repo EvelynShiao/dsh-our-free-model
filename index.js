@@ -2471,30 +2471,45 @@ function buildSummary(deps) {
      与其他模型一样走 snapshot.results：没探过=灰字「未探测」，探过=真实判定
      （含 ttft/latency 测速）。laneHealth 不再参与显示，仅在 runtime 内部维护。 */
   const unprobed = entry => isAggregateEntry(entry) || isComboEntry(entry)
+  /* 2026-11-05（用户定案「凭什么要一直继承最后一次探测」）：判定有效期 8 小时。
+     超过 8 小时的旧判定不再当有效结果显示（灰「未探测」）——探针停摆（interval=0）
+     或长期没跑时，旧红标会永远挂着误导人。只影响 summary 显示层，聊天路由与
+     availability.json 数据本身不动；aggregate/combo 视图行语义不变。 */
+  const VERDICT_TTL_MS = 8 * 60 * 60 * 1000
+  const freshRecord = entry => {
+    if (isAggregateEntry(entry) || isComboEntry(entry)) return null
+    const record = snapshot.results?.[entry.id]
+    return record?.at && Date.now() - record.at <= VERDICT_TTL_MS ? record : null
+  }
   return {
-    catalog: state.catalog.map(entry => ({
-      ...entry,
-      ...(unprobed(entry)
-        ? { availability: STATE.available, detail: '', probedAt: 0 }
-        : {
-            availability: snapshot.results?.[entry.id]?.state ?? STATE.unknown,
-            detail: snapshot.results?.[entry.id]?.detail ?? '',
-            probedAt: snapshot.results?.[entry.id]?.at ?? 0,
-          }),
-      ttftMs: unprobed(entry) ? undefined : snapshot.results?.[entry.id]?.ttftMs,
-      tps: unprobed(entry) ? undefined : snapshot.results?.[entry.id]?.tps,
-      latencyMs: unprobed(entry) ? undefined : snapshot.results?.[entry.id]?.latencyMs,
-      // What each rung of the effort menu will really put on the wire for this
-      // model, so the page never shows a 32K "output ceiling" beside a call that
-      // was cut off at 8K. A model with no effort menu has no ladder to show.
-      // 档位阶梯只在真的分档时才展示（2026-10-15 起额度以模型上限为准，
-      // 三档同值，再显示「档位」是噪音）。
-      ...(entry.reasoning === true ? rungBudgets(entry, defaultMaxTokens) : {}),
-      // `null` here is what the picker does not advertise; the roster still lists
-      // those models, because "the probe refused it" is the user's only evidence.
-      route: (state.membership[ROUTE_MAIN] ?? []).includes(entry.id) ? ROUTE_MAIN
-        : (state.membership[ROUTE_REGION] ?? []).includes(entry.id) ? ROUTE_REGION : null,
-    })),
+    catalog: state.catalog.map(entry => {
+      const record = freshRecord(entry)
+      return {
+        ...entry,
+        ...(record
+          ? {
+              availability: record.state,
+              detail: record.detail ?? '',
+              probedAt: record.at,
+              ttftMs: record.ttftMs,
+              tps: record.tps,
+              latencyMs: record.latencyMs,
+            }
+          : unprobed(entry)
+            ? { availability: STATE.available, detail: '', probedAt: 0, ttftMs: undefined, tps: undefined, latencyMs: undefined }
+            : { availability: STATE.unknown, detail: '', probedAt: 0, ttftMs: undefined, tps: undefined, latencyMs: undefined }),
+        // What each rung of the effort menu will really put on the wire for this
+        // model, so the page never shows a 32K "output ceiling" beside a call that
+        // was cut off at 8K. A model with no effort menu has no ladder to show.
+        // 档位阶梯只在真的分档时才展示（2026-10-15 起额度以模型上限为准，
+        // 三档同值，再显示「档位」是噪音）。
+        ...(entry.reasoning === true ? rungBudgets(entry, defaultMaxTokens) : {}),
+        // `null` here is what the picker does not advertise; the roster still lists
+        // those models, because "the probe refused it" is the user's only evidence.
+        route: (state.membership[ROUTE_MAIN] ?? []).includes(entry.id) ? ROUTE_MAIN
+          : (state.membership[ROUTE_REGION] ?? []).includes(entry.id) ? ROUTE_REGION : null,
+      }
+    }),
     settings: publicSettings(deps.settings.get(), forwardInfo, deps.egressInfo()),
     egress: forwardInfo.egress ?? snapshot.egress ?? null,
     outlet: deps.egressInfo(),
