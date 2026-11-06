@@ -1,102 +1,53 @@
 /**
- * Upstream wire for the免密 free lane.
+ * Upstream wire for the免密 free lane — o2a v1.4.6 整形层接入版
  *
- * Every fact encoded here was verified against the live gateway on 2026-09-24
- * by direct request: the public pooled
- * credential, the client fingerprint headers, the per-model endpoint split, the
- * free-tier tool-fingerprint gate (403 FreeTierError without it), the
- * per-session quota accounting (429 FreeUsageLimitError when a fresh session is
- * minted per request), and the regional gate (403 RegionError).
+ * 关键变更（vs 旧版）：
+ * - UA: opencode/latest/2.1.1/cli (v2 客户端)
+ * - 头集: v2 四会话头 + x-opencode-project(40-hex/请求) + 无 x-opencode-request
+ * - 会话: 慢钟铸造(UTC零点-≤30天哈希偏移)，进程盐分离重启，过期自动重铸
+ * - 端点: 族路径 /inference/<family>/v1/...；Anthropic 加 ?beta=true
+ * - 工具: 客户工具全改名 clint_<sha12> + 响应侧还原（幂等）
+ * - Body: stream_options.include_usage:true + max_completion_tokens:32000
+ * - 指纹: 仅改名，不再注入 13 官方工具/系统提示（第二批启用）
  *
  * @module src/upstream.js
  */
-
 import crypto from 'node:crypto'
+import {
+  CLIENT_UA,
+  ANONYMOUS_CREDENTIAL,
+  V2_COMPLETION_LIMIT,
+  canonicalSessionID,
+  sessionPhaseMs,
+  phaseAgeMs,
+  projectID,
+  randomProjectID,
+  gatewayHeaders as o2aGatewayHeaders,
+  renameAndCompleteTools,
+  rewriteToolReferences,
+  renamableToolName,
+  officialToolDefinition,
+  V2_OFFICIAL_TOOL_ORDER,
+} from './o2a/index.js'
 
-/**
- * Overridable so the selftest can point the adapter at a dead port and exercise
- * the transport-failure path without touching the real free lane's quota.
- */
+/** 可覆盖基址（selftest 用） */
 export const UPSTREAM_BASE = process.env.OUR_FREE_MODEL_BASE ?? 'https://opencode.ai'
 
-/** A version >= 1.17 is required by the gateway's User-Agent check. */
-export const CLIENT_UA = 'opencode/1.18.31'
-const MAX_SESSION_LENGTH = 256
-const MAX_TOOL_NAME_LEN = 128
-const BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
-
-/** The lowercase tool quartet the free tier requires to be declared. */
-export const FINGERPRINT_TOOLS = ['bash', 'glob', 'grep', 'read']
-
-/**
- * Quartet slots that a tool the caller already has can answer for, keyed by the
- * required spelling. dsh names its shell tool `pwsh` on Windows
- * (`packages/shell/tool-pwsh`) and `bash` elsewhere (`packages/shell/tool-bash`),
- * so the same plugin must fill the slot from whichever the kernel mounted.
- */
-const QUARTET_DONORS = { bash: ['pwsh'] }
-
-/** Models served by /responses instead of /chat/completions. */
-const RESPONSES_MODELS = new Set(['muse-spark-1.2-contributor-free', 'muse-spark-1.3-contributor-free'])
-/** Models served by the Anthropic-shaped /messages endpoint. */
-const MESSAGES_MODELS = new Set(['union-alpha'])
-
+/** 会话/请求 ID 正则 */
 export const SESSION_RE = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/
 export const REQUEST_RE = /^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/
 
 const ANTHROPIC_API_VERSION = '2023-06-01'
 
-function base62From(bytes) {
-  let out = ''
-  for (const byte of bytes) out += BASE62[byte % 62]
-  return out
-}
+/** v1 指纹工具四重奏（供 forward 等兼容层使用） */
+export const FINGERPRINT_TOOLS = ['bash', 'glob', 'grep', 'read']
 
-let lastStamp = 0
-let seq = 0
+/** Responses 线模型 */
+const RESPONSES_MODELS = new Set(['muse-spark-1.2-contributor-free', 'muse-spark-1.3-contributor-free'])
+/** Messages 线模型 */
+const MESSAGES_MODELS = new Set(['union-alpha'])
 
-/** Mint a gateway-shaped canonical session id (time-prefixed, monotonic counter). */
-export function mintSessionId(timestamp = Date.now()) {
-  if (timestamp !== lastStamp) { lastStamp = timestamp; seq = 0 }
-  seq += 1
-  const value = ~(BigInt(timestamp) * 0x1000n + BigInt(seq))
-  let hex = ''
-  for (let i = 0; i < 6; i += 1) hex += Number((value >> BigInt(40 - 8 * i)) & 0xffn).toString(16).padStart(2, '0')
-  return `ses_${hex}${base62From(crypto.randomBytes(14))}`
-}
-
-/** Mint a gateway-shaped request id for one turn. */
-export function mintRequestId(timestamp = Date.now()) {
-  const value = BigInt(timestamp) * 0x1000n + 1n
-  let hex = ''
-  for (let i = 0; i < 6; i += 1) hex += Number((value >> BigInt(40 - 8 * i)) & 0xffn).toString(16).padStart(2, '0')
-  return `msg_${hex}${base62From(crypto.randomBytes(14))}`
-}
-
-/**
- * Map one downstream conversation onto one stable upstream session.
- *
- * Free-tier quota is accounted per session, so a fresh id per request exhausts
- * it and surfaces as 429 with growing retry-after. A digest of the harness
- * session id gives the same conversation the same canonical session across
- * restarts, which is how the real client behaves.
- */
-export function sessionForConversation(sessionId) {
-  if (typeof sessionId === 'string' && SESSION_RE.test(sessionId.trim())) return sessionId.trim()
-  const seed = typeof sessionId === 'string' && sessionId.trim() ? sessionId.trim() : 'global'
-  const digest = crypto.createHash('sha256').update(`our-free-model\0${seed}`).digest()
-  return `ses_${digest.subarray(0, 6).toString('hex')}${base62From(digest.subarray(6, 20))}`
-}
-
-/** Stable per-turn request id: retries of the same turn share it. */
-export function requestIdFor(sessionId, turnSeed) {
-  if (typeof turnSeed !== 'string' || turnSeed === '') return mintRequestId()
-  const digest = crypto.createHash('sha256').update(`our-free-model-req\0${sessionId}\0${turnSeed}`).digest()
-  const id = `msg_${digest.subarray(0, 6).toString('hex')}${base62From(digest.subarray(6, 20))}`
-  return REQUEST_RE.test(id) ? id : mintRequestId()
-}
-
-/** Strip a trailing "(level)" thinking suffix so lookups hit the base id. */
+/** 去掉尾部 "(level)" 思维链后缀 */
 export function baseModelId(model) {
   return String(model ?? '').replace(/\([^()]+\)\s*$/, '').trim()
 }
@@ -115,152 +66,139 @@ export function isMessagesModel(modelId) {
   return MESSAGES_MODELS.has(baseModelId(modelId))
 }
 
-/** Which upstream path serves this model. */
+/**
+ * 端点族路径（v2 形状）：/inference/<family>/v1/...
+ * 旧扁平 /zen/v1/... 仍可用，但族路径是 2.1 客户端标准
+ */
 export function endpointFor(modelId) {
-  if (isResponsesModel(modelId)) return '/zen/v1/responses'
-  if (isMessagesModel(modelId)) return '/zen/v1/messages'
-  return '/zen/v1/chat/completions'
+  const base = baseModelId(modelId)
+  let family = 'openai'
+  if (isMessagesModel(base)) family = 'anthropic'
+  else if (isResponsesModel(base)) family = 'openai' // Responses 也走 openai 族
+  const path = `/inference/${family}/v1/${isMessagesModel(base) ? 'messages' : isResponsesModel(base) ? 'responses' : 'chat/completions'}`
+  return isMessagesModel(base) ? `${path}?beta=true` : path
 }
 
-/** The wire shape one endpoint speaks; drives request encoding and response parsing. */
+/** 线形状：chat | responses | messages */
 export function wireFor(modelId) {
-  const path = endpointFor(modelId)
-  if (path === '/zen/v1/responses') return 'responses'
-  if (path === '/zen/v1/messages') return 'messages'
+  if (isMessagesModel(modelId)) return 'messages'
+  if (isResponsesModel(modelId)) return 'responses'
   return 'chat'
 }
 
 /**
- * The headers the gateway fingerprints a genuine desktop client by.
- * `Authorization: Bearer public` is the pooled免密 credential — there is no
- * per-user secret on this lane.
+ * v2 网关头集（含项目级配额隔离）——兼容旧签名
+ * 旧签名: { session, requestId, stream, accept }
+ * 新签名: { session, childSession, project, stream, accept }
+ * @returns {Record<string, string>}
  */
-export function gatewayHeaders({ session, requestId, stream, accept }) {
-  const headers = {
-    'content-type': 'application/json',
-    'authorization': 'Bearer public',
-    'user-agent': CLIENT_UA,
-    'x-opencode-client': 'desktop',
-    'x-opencode-session': session,
-    'x-opencode-request': requestId,
-    'x-opencode-project': 'global',
-    'accept': accept ?? (stream ? 'text/event-stream' : '*/*'),
+export function gatewayHeaders(opts = {}) {
+  const { session, childSession, project, stream, accept, requestId } = opts
+  // 旧签名检测：有 requestId 且无 childSession/project
+  const isLegacy = requestId !== undefined && childSession === undefined && project === undefined
+  return o2aGatewayHeaders({
+    session: truncateSession(session),
+    childSession: isLegacy ? undefined : childSession,
+    project: isLegacy ? randomProjectID() : (project ?? randomProjectID()),
+    anthropic: false,
+    accept: isLegacy ? (stream ? 'text/event-stream' : '*/*') : accept,
+    userAgent: CLIENT_UA,
+  })
+}
+
+/** 规范会话 ID（慢钟铸造，进程盐，过期自动重铸） */
+export function sessionForConversation(sessionId) {
+  if (typeof sessionId === 'string' && SESSION_RE.test(sessionId.trim())) {
+    const trimmed = sessionId.trim()
+    // 已是合法官方 ID 则保留；但若相位过期则重铸
+    if (phaseAgeMs(sessionPhaseMs(trimmed)) > 400 * 24 * 60 * 60 * 1000) {
+      return canonicalSessionID(sessionId)
+    }
+    return trimmed
   }
-  return headers
+  const seed = typeof sessionId === 'string' && sessionId.trim() ? sessionId.trim() : 'global'
+  return canonicalSessionID(seed)
 }
 
-function toolNameOf(tool) {
-  if (!tool || typeof tool !== 'object' || Array.isArray(tool)) return ''
-  if (typeof tool.name === 'string' && tool.name.trim()) return tool.name.trim()
-  const fn = tool.function
-  if (fn && typeof fn === 'object' && !Array.isArray(fn) && typeof fn.name === 'string') return fn.name.trim()
-  return ''
+/** 每轮稳定请求 ID：同一 turn 重试共享 */
+export function requestIdFor(sessionId, turnSeed) {
+  if (typeof turnSeed !== 'string' || turnSeed === '') return mintRequestId()
+  const digest = crypto.createHash('sha256').update(`our-free-model-req\0${sessionId}\0${turnSeed}`).digest()
+  const hex = digest.subarray(0, 6).toString('hex')
+  const b62 = base62From(digest.subarray(6, 20))
+  return `msg_${hex}${b62}`
 }
 
-function quartetKey(name) {
-  const lower = String(name ?? '').trim().toLowerCase()
-  return FINGERPRINT_TOOLS.includes(lower) ? lower : ''
+/** 简单请求 ID 铸造（时间前缀 + 随机） */
+function mintRequestId(timestamp = Date.now()) {
+  const value = BigInt(timestamp) * 0x1000n + 1n
+  let hex = ''
+  for (let i = 0; i < 6; i += 1) hex += Number((value >> BigInt(40 - 8 * i)) & 0xffn).toString(16).padStart(2, '0')
+  return `msg_${hex}${base62From(crypto.randomBytes(14))}`
 }
 
-/** The Chat-shape `{function:{…}}` wrapper, or null for the flat Responses one. */
-function functionOf(tool) {
-  return tool.function && typeof tool.function === 'object' && !Array.isArray(tool.function) ? tool.function : null
+const BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+function base62From(bytes) {
+  let out = ''
+  for (const byte of bytes) out += BASE62[byte % 62]
+  return out
 }
 
 /**
- * Satisfy the free-tier fingerprint gate on `body.tools`.
- *
- * The gate demands all four lowercase quartet names be declared. dsh's own
- * shell/filesystem tools already answer to `bash`/`glob`/`grep`/`read` on the
- * lane that names its shell `bash`, so a normal agent turn declares them for
- * real; a slot the caller does not field is filled by promoting a tool that can
- * genuinely answer for it (see {@link QUARTET_DONORS}) before it is faked, and
- * only a slot with nothing to promote gets a self-disabling decoy. Case variants
- * are canonicalised rather than duplicated (upstream rejects `Bash` + `bash` as a
- * duplicate), and the rename map lets the response side restore the caller's
- * spelling — which is what makes a promoted tool callable.
- *
- * @param {object} body - request body, mutated in place
- * @param {boolean|'claude'} style - true 为 Responses，false 为 Chat，claude 为 Messages
- * @returns {Map<string, string>} sent spelling -> caller spelling
+ * 完整整形入口：头 + Body（工具改名 + 引用重写 + Body 补齐）
+ * @param {object} body - 请求体，原地修改
+ * @param {string} modelId - 模型 ID
+ * @param {string} sessionId - 规范会话 ID
+ * @param {string} [project] - 项目信号
+ * @returns {{ renames: Map, shape: string }} 重命名映射 + 线形状
  */
-export function applyFingerprint(body, style) {
-  const flat = style === true
-  const claude = style === 'claude'
-  const map = new Map()
-  const tools = Array.isArray(body.tools) ? body.tools : []
-  const hadClientTools = tools.length > 0
-  const seen = new Set()
-  const out = []
+export function applyFingerprint(body, modelId, sessionId, project) {
+  const shape = wireFor(modelId)
+  const isChat = shape === 'chat'
+  const isMessages = shape === 'messages'
 
-  for (const tool of tools) {
-    const current = toolNameOf(tool)
-    const key = quartetKey(current)
-    if (!key) { out.push(tool); continue }
-    if (seen.has(key)) continue
-    seen.add(key)
-    if (current !== key) {
-      map.set(key, current)
-      const fn = functionOf(tool)
-      out.push(fn ? { ...tool, function: { ...fn, name: key } } : { ...tool, name: key })
-    } else {
-      out.push(tool)
+  // 1. 工具改名 + 引用重写（幂等：clint_ 前缀跳过）
+  const { renames } = renameAndCompleteTools(body, shape)
+
+  // 2. Body 补齐（仅 Chat 线）
+  if (isChat) {
+    // stream_options.include_usage: true
+    if (body.stream === true) {
+      if (body.stream_options && typeof body.stream_options === 'object' && !Array.isArray(body.stream_options)) {
+        if (body.stream_options.include_usage !== true) body.stream_options = { ...body.stream_options, include_usage: true }
+      } else {
+        body.stream_options = { include_usage: true }
+      }
+    }
+    // max_completion_tokens: 32000（无上限时）
+    if (body.max_completion_tokens === undefined && body.max_tokens === undefined) {
+      body.max_completion_tokens = V2_COMPLETION_LIMIT
+    }
+    // tool_choice: 'none' 兜底清除（v2 门禁见即 403）
+    if (body.tool_choice !== undefined) {
+      const tc = body.tool_choice
+      if (tc === 'none' || (tc && typeof tc === 'object' && tc.type === 'none')) delete body.tool_choice
     }
   }
 
-  // A decoy is a name the model will call: with only `pwsh` on the session, the
-  // `bash` decoy was recorded being invoked 24 times in one run, every one of
-  // them an unknown tool. Promoting the real shell into the slot costs the gate
-  // nothing — it fingerprints the declared names — and the call comes back
-  // executable.
-  const promoted = new Set()
-  for (const name of FINGERPRINT_TOOLS) {
-    if (seen.has(name)) continue
-    const donors = QUARTET_DONORS[name] ?? []
-    const index = out.findIndex(tool => {
-      const original = toolNameOf(tool)
-      if (original === '' || quartetKey(original) !== '') return false
-      const lower = original.toLowerCase()
-      return !promoted.has(lower) && donors.includes(lower)
-    })
-    if (index === -1) continue
-    const tool = out[index]
-    const original = toolNameOf(tool)
-    promoted.add(original.toLowerCase())
-    map.set(name, original)
-    const fn = functionOf(tool)
-    out[index] = fn ? { ...tool, function: { ...fn, name } } : { ...tool, name }
-    seen.add(name)
-  }
+  // 3. Anthropic beta 头在 gatewayHeaders 里按 model 加
 
-  for (const name of FINGERPRINT_TOOLS) {
-    if (seen.has(name)) continue
-    out.push(claude
-      ? { name, description: 'This tool is currently unavailable and must not be used.', input_schema: { type: 'object', properties: {} } }
-      : flat
-        ? { type: 'function', name, description: 'This tool is currently unavailable and must not be used.', parameters: { type: 'object', properties: {} } }
-        : { type: 'function', function: { name, description: 'This tool is currently unavailable and must not be used.', parameters: { type: 'object', properties: {} } } })
-  }
-
-  body.tools = out
-  if (!body.tool_choice) {
-    if (flat) body.tool_choice = 'auto'
-    else if (!hadClientTools) body.tool_choice = claude ? { type: 'none' } : 'none'
-  }
-  return map
+  return { renames, shape }
 }
 
-/** Restore the caller's tool spelling in a streaming delta or a final payload. */
-export function restoreToolName(name, map) {
-  if (!map || map.size === 0) return name
-  return map.get(name) ?? name
+/** 恢复调用方工具拼写（流式 delta / 最终载荷） */
+export function restoreToolName(name, renames) {
+  if (!renames || renames.size === 0) return name
+  // renames 可能是 ToolRenameMap 或普通 Map
+  if (typeof renames.resolve === 'function') return renames.resolve(name)
+  return renames.get(name) ?? name
 }
 
-/** Session-scoped identity used to pick a decoy out of a real tool call. */
+/** 取 body 中声明的工具名集合 */
 export function declaredToolNames(body) {
   const names = new Set()
   for (const tool of Array.isArray(body.tools) ? body.tools : []) {
-    const n = toolNameOf(tool)
+    const n = renamableToolName('chat', tool) // 形状不影响名提取
     if (n) names.add(n)
   }
   return names
@@ -269,7 +207,7 @@ export function declaredToolNames(body) {
 function truncateSession(value) {
   if (typeof value !== 'string') return ''
   const trimmed = value.trim()
-  return trimmed.length > MAX_SESSION_LENGTH ? trimmed.slice(0, MAX_SESSION_LENGTH) : trimmed
+  return trimmed.length > 256 ? trimmed.slice(0, 256) : trimmed
 }
 
-export { truncateSession, ANTHROPIC_API_VERSION, MAX_TOOL_NAME_LEN }
+export { truncateSession, ANTHROPIC_API_VERSION }

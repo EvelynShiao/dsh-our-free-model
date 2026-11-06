@@ -221,7 +221,7 @@ export async function probeModel(model, { attributionUserAgent, signal, timeoutM
   const session = sessionForConversation('probe:our-free-model')
   const wire = wireFor(model.id)
   const body = buildPing(model.id, wire)
-  applyFingerprint(body, wire === 'responses')
+  applyFingerprint(body, model.id, session, session)
 
   let firstDelta
   let streamError
