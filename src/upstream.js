@@ -30,6 +30,9 @@ import {
   V2_OFFICIAL_TOOL_ORDER,
 } from './o2a/index.js'
 
+/** 工具名长度限制（沿用旧版定值，确保 messages.js 兼容） */
+export const MAX_TOOL_NAME_LEN = 128
+
 /** 可覆盖基址（selftest 用） */
 export const UPSTREAM_BASE = process.env.OUR_FREE_MODEL_BASE ?? 'https://opencode.ai'
 
@@ -129,8 +132,8 @@ export function requestIdFor(sessionId, turnSeed) {
   return `msg_${hex}${b62}`
 }
 
-/** 简单请求 ID 铸造（时间前缀 + 随机） */
-function mintRequestId(timestamp = Date.now()) {
+/** 简单请求 ID 铸造（时间前缀 + 随机）——adapter/probe/core 都要用，必须导出 */
+export function mintRequestId(timestamp = Date.now()) {
   const value = BigInt(timestamp) * 0x1000n + 1n
   let hex = ''
   for (let i = 0; i < 6; i += 1) hex += Number((value >> BigInt(40 - 8 * i)) & 0xffn).toString(16).padStart(2, '0')
@@ -155,10 +158,13 @@ function base62From(bytes) {
 export function applyFingerprint(body, modelId, sessionId, project) {
   const shape = wireFor(modelId)
   const isChat = shape === 'chat'
-  const isMessages = shape === 'messages'
+  /* o2a 的 toolshape 只认 chat|flat|claude 三种「风格」，而 wireFor 给的是
+     chat|responses|messages 三种「线」——必须翻译，否则 responses/messages
+     线会命中 null 形状分支、工具静默不改名（v2 指纹就白做了）。 */
+  const style = shape === 'responses' ? 'flat' : shape === 'messages' ? 'claude' : 'chat'
 
   // 1. 工具改名 + 引用重写（幂等：clint_ 前缀跳过）
-  const { renames } = renameAndCompleteTools(body, shape)
+  const { renames } = renameAndCompleteTools(body, style)
 
   // 2. Body 补齐（仅 Chat 线）
   if (isChat) {
@@ -210,4 +216,4 @@ function truncateSession(value) {
   return trimmed.length > 256 ? trimmed.slice(0, 256) : trimmed
 }
 
-export { truncateSession, ANTHROPIC_API_VERSION }
+export { truncateSession, ANTHROPIC_API_VERSION, CLIENT_UA }
