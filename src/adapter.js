@@ -584,8 +584,11 @@ export class FreeModelAdapter {
     /* 2026-10-14 免费车道改造：OpenCode v2 网关要求 session 为其服务端注册的真实会话，
        伪造身份一律 403（实测 UA/四个 session 头/project 全试过）。这一条纯免费车道
        （既不是 EAC/kilo 吸收渠道，也不是聚合行）改走本地 opencode 服务代发；
-       kilo/aggregate/EAC 走原路不动。settings.bridgeLocalOpencode === false 可关。 */
-    if (!sealed && !kilo && !aggregate && settings.bridgeLocalOpencode !== false) {
+       kilo/aggregate/EAC 走原路不动。
+       2026-11-07 用户定案「请求必须从客户端发出，不要直发」：这条车道**写死**只走
+       本地客户端代发，不再保留 settings.bridgeLocalOpencode === false 的直连逃生口
+       （实测直连指纹怎么改都过不了 v2 门禁，留着只会把额度烧在死路上）。 */
+    if (!sealed && !kilo && !aggregate) {
       yield * this.runBridge(options, entry, started)
       return { advance: false, verdict: null, ok: true }
     }

@@ -2058,7 +2058,12 @@ function createApiRoutes(deps) {
         return send(200, { ok: true, settings: publicSettings(deps.settings.get(), deps.forwardInfo(), deps.egressInfo()) })
       }
       if (method === 'POST' && routePath === '/refresh') {
-        await deps.refreshCatalog({ probe: true, force: true })
+        /* 2026-11-07 用户定案：客户端「刷新清单」按钮**只刷名单，不探测**。
+           此前这里传 probe:true，点一下就是一轮全量真实请求（zen 免费车道一次
+           几十发，2026-11-07 13:13 实测整轮 503），会把免费池额度当场打穿——
+           与「名单轮纯 GET 不烧额度」的设计相反。要探真实可用性用「立即探测」
+           （/reprobe，用户明确授权的动作，带 probeForceLane）。 */
+        await deps.refreshCatalog({ probe: false, force: true })
         return send(200, { ok: true, ...buildSummary(deps) })
       }
       if (method === 'POST' && routePath === '/reprobe') {
