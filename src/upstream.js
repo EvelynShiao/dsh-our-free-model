@@ -1,8 +1,8 @@
 /**
- * Upstream wire for the免密 free lane — o2a v1.4.6 整形层接入版
+ * Upstream wire for the免密 free lane — o2a v1.4.7 整形层接入版
  *
  * 关键变更（vs 旧版）：
- * - UA: opencode/latest/2.1.1/cli (v2 客户端)
+ * - UA: opencode/latest/2.2.6/cli (v2 客户端，2026-11-08 轮换)
  * - 头集: v2 四会话头 + x-opencode-project(40-hex/请求) + 无 x-opencode-request
  * - 会话: 慢钟铸造(UTC零点-≤30天哈希偏移)，进程盐分离重启，过期自动重铸
  * - 端点: 族路径 /inference/<family>/v1/...；Anthropic 加 ?beta=true
