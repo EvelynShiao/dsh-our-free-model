@@ -630,6 +630,14 @@ export async function bridgeStream({ modelId, prompt, directory, signal, onDelta
       reject: (error) => { if (!settled) { settled = true; reject(error); } },
     };
   });
+  /* 2026-11-10 晚「finished 无 awaiter 窗口」补雷（18:30:48 二次现场实锤，a68ff3e 的
+     cancel+abort 闸没拦住；sse-repro2.mjs 复现台定案）：try 卡在 await fetch(POST /prompt)
+     ——冷启动服务不回响应头、POST 挂起——时，SSE sub 若先断（实测开口 20ms 即断），
+     reader reject → settle.reject → finished 在无人 await 的时刻被拒 → unhandledRejection
+     → 宿主 fatal 兜底杀掉整个 DSH 主进程。settle 守卫只防双 settle，防不了这个窗口。
+     保险带让 finished 的拒绝永远有人接住（await 路径照常收到原错误，行为不变）；
+     sse-repro2 四变体实测：裸奔 raw/raw-postkill 必漏，belt/belt-postkill 零漏网。 */
+  finished.catch(() => {});
 
   /* 事件订阅（失败即让本次调用失败，绝不静默卡住） */
   const sub = await fetch(`${svc.url}/api/event`, {
