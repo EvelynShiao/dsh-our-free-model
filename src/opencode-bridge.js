@@ -247,6 +247,49 @@ function portOpen(url, timeoutMs = 700) {
   });
 }
 
+/* 2026-11-10 深夜「冷启动首条消息必败」根治·第一层（20:05 实锤时间线）：`service start`
+   命令 20:05:18.4 返回，真服务进程 20:05:22.9 才开始 serve，内部 boot 到 23.298 才完成——
+   而旧判活只看 TCP portOpen：端口一通就放行，bridgeStream 的 SSE 订阅开口 19ms 即断、
+   POST /prompt 6ms 被掐（opencode 侧 23.234 同毫秒留痕），整轮以 BRIDGE_FAILED「fetch
+   failed」收场。TCP 通 ≠ 服务就绪：这里加「SSE 稳定门」——/api/event 开流后撑满 holdMs
+   不断线才算就绪（冷启动窗口内实测开口 6~20ms 即断，必被拦下；服务真正 boot 完成后
+   SSE 天然长连，500ms 轻松撑过）。探针/热路径不受影响：fast path 仍只 portOpen，
+   零额外延迟。 */
+const SSE_READY_HOLD_MS = 500;
+
+function sseReady(svc, holdMs = SSE_READY_HOLD_MS) {
+  return new Promise(resolve => {
+    let settled = false;
+    let opened = false;
+    const ac = new AbortController();
+    const finish = value => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { ac.abort(); } catch { /* 已断 */ }
+      resolve(value);
+    };
+    const timer = setTimeout(() => finish(opened), holdMs);
+    fetch(`${svc.url}/api/event`, {
+      headers: { ...headers(svc), Accept: 'text/event-stream' },
+      signal: ac.signal,
+    }).then(res => {
+      if (!res.ok || res.body === null) {
+        try { res.body?.cancel(); } catch { /* 无体可消 */ }
+        finish(false);
+        return;
+      }
+      opened = true;
+      const reader = res.body.getReader();
+      const chew = () => { reader.read().then(chew, () => finish(false)); };
+      chew();
+    }).catch(() => finish(false));
+  });
+}
+
+/* 距服务最近一次真正拉起/重启成功的时刻（ms）。冷启动重试窗口的判定依据。 */
+let lastBridgeStartAt = 0;
+
 let pendingStart = null;
 
 /**
@@ -277,7 +320,12 @@ export async function ensureService({ autostart = bridgeConfig.autostart } = {})
     while (Date.now() < deadline) {
       await new Promise(resolve => setTimeout(resolve, 150));
       const svc = readService();
-      if (svc !== null && await portOpen(svc.url)) return svc;
+      /* 2026-11-10：TCP 通之外再加 SSE 稳定门——端口一通就放行会打进 boot 未完成的
+         半初始化服务（20:05 实锤：端口 23.0 通、内脏 23.298 才 boot 完），首条消息必败。 */
+      if (svc !== null && await portOpen(svc.url) && await sseReady(svc)) {
+        lastBridgeStartAt = Date.now();
+        return svc;
+      }
     }
     return null;
   })().finally(() => { pendingStart = null });
@@ -461,7 +509,12 @@ async function restartBridgeService() {
     const deadline = Date.now() + START_TIMEOUT_MS
     while (Date.now() < deadline) {
       const svc = await ensureService({ autostart: false })
-      if (svc !== null) return svc
+      /* 2026-11-10：重启后同样要过 SSE 稳定门——stop+start 的空窗里 portOpen 可能
+         探到将死旧服务或刚绑端口的半初始化新服务（同 20:05 冷启动案）。 */
+      if (svc !== null && await sseReady(svc)) {
+        lastBridgeStartAt = Date.now();
+        return svc
+      }
       await new Promise(resolve => setTimeout(resolve, 200))
     }
     return null
@@ -579,7 +632,7 @@ export function assertFreeModel(modelId) {
  *          onUsage?:(tokens:object)=>void}} options
  * @returns {Promise<string>} 全文
  */
-export async function bridgeStream({ modelId, prompt, directory, signal, onDelta, onReasoning, onUsage, autostart = bridgeConfig.autostart }) {
+async function bridgeStreamOnce({ modelId, prompt, directory, signal, onDelta, onReasoning, onUsage, autostart = bridgeConfig.autostart }) {
   const id = assertFreeModel(modelId)
   let svc = await ensureService({ autostart })
   /* 2026-10-31：mute2 定义刚补写/升级（ensurePipeAgent 返回 'updated'）时，运行中的
@@ -758,6 +811,34 @@ export async function bridgeStream({ modelId, prompt, directory, signal, onDelta
     try { await res?.body?.cancel(); } catch { /* 响应体销毁失败不追责 */ }
     try { ac.abort(); } catch { /* 保险丝 */ }
     signal?.removeEventListener('abort', onOuter);
+  }
+}
+
+/* 2026-11-10 深夜「冷启动首条消息必败」第二层保险带：ensureService 的 SSE 稳定门治本
+   之后，仍可能存在「刚放行服务就出连接类闪失」的残余窗口。这里整轮兜底重试一次，
+   触发条件全部收紧：①错误是连接类（fetch failed / 事件流打不开——正是 20:05 的
+   收场方式；300s 闲置 terminated 走重订阅、会话执行失败走如实报错，都不在列）；
+   ②本轮零输出（重试绝不重复投递 delta，也几乎不会重复烧上游）；③外层未 abort；
+   ④距服务最近一次拉起/重启 <30s（只兜冷启动，热路径行为零变化）。第二次仍失败
+   如实抛出，不无限重试。 */
+const COLD_RETRY_WINDOW_MS = 30_000;
+
+export async function bridgeStream(options = {}) {
+  let emitted = false;
+  const wrapped = {
+    ...options,
+    onDelta: (delta, full) => { emitted = true; options?.onDelta?.(delta, full); },
+    onReasoning: (delta, full) => { emitted = true; options?.onReasoning?.(delta, full); },
+  };
+  try {
+    return await bridgeStreamOnce(wrapped);
+  } catch (error) {
+    const msg = String(error?.message ?? error);
+    if (emitted || options?.signal?.aborted === true) throw error;
+    if (!/fetch failed|事件流打不开/i.test(msg)) throw error;
+    if (Date.now() - lastBridgeStartAt > COLD_RETRY_WINDOW_MS) throw error;
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    return bridgeStreamOnce(wrapped);
   }
 }
 
