@@ -124,6 +124,11 @@ export function createModelRuntime({
     warn: message => logger.warn?.(message) ?? logger.log?.(message),
     onRegionBlocked: () => {
       if (disposed || reprobeTimer !== undefined) return
+      /* 2026-11-04 用户定案「探测间隔=0 就是不探测」：地区封锁不再触发自动补探。
+         此前这条暗道无视间隔设置——任何请求撞上 region-blocked 4 秒后就烧一整轮
+         全量探测（onRegionBlocked → refreshAvailability(true)），是 2026-11-09 早晨
+         换 IP 重启后自动全量探测的另一半真凶。 */
+      if (!(Number(settings.get().probeIntervalMinutes) > 0)) return
       reprobeTimer = setTimeout(() => {
         reprobeTimer = undefined
         if (!disposed) void refreshAvailability(true).catch(error => {
@@ -349,8 +354,16 @@ export function createModelRuntime({
     if (changed) {
       availability.update({ egress: seen })
       availability.flush()
-      logger.info?.(`our-free-model: egress changed to ${seen.ip}${seen.country ? ` (${seen.country})` : ''}; re-probing availability`)
-      await refreshAvailability(true)
+      /* 2026-11-04 用户定案「探测间隔=0 就是不探测」：出口 IP 变化只记档不补探。
+         此前这条暗道无视间隔设置——动态 IP 每次轮换（2026-11-09 实锤 .95→.105）
+         加上重启，就在启动路径里自动烧一整轮全量探测，正是用户看到的那次「无人
+         触发的探测」。间隔>0 时保留原有换网即补探的行为。 */
+      if (Number(settings.get().probeIntervalMinutes) > 0) {
+        logger.info?.(`our-free-model: egress changed to ${seen.ip}${seen.country ? ` (${seen.country})` : ''}; re-probing availability`)
+        await refreshAvailability(true)
+      } else {
+        logger.info?.(`our-free-model: egress changed to ${seen.ip}${seen.country ? ` (${seen.country})` : ''}; auto re-probe skipped (probe interval = 0)`)
+      }
     }
     return true
   }
