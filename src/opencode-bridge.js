@@ -722,8 +722,9 @@ export async function bridgeStream({ modelId, prompt, directory, signal, onDelta
   let guard = setTimeout(onGuardFire, 900000);
   function onGuardFire() { settle.reject(new Error('本地 opencode 会话超过 900 秒无输出')) }
   const resetGuard = () => { clearTimeout(guard); guard = setTimeout(onGuardFire, 900000); };
+  let res = null;
   try {
-    const res = await fetch(`${svc.url}/api/session/${encodeURIComponent(session.id)}/prompt`, {
+    res = await fetch(`${svc.url}/api/session/${encodeURIComponent(session.id)}/prompt`, {
       method: 'POST',
       headers: headers(svc),
       body: JSON.stringify({ text: prompt }),
@@ -736,7 +737,18 @@ export async function bridgeStream({ modelId, prompt, directory, signal, onDelta
     return await finished;
   } finally {
     clearTimeout(guard);
-    ac.abort();
+    /* 2026-11-10 修「冷启动首条 Mimo 消息炸掉整个 DSH」（17:37:47 保全器实锤：
+       fatal load failure DOMException [AbortError] at bridgeStream）。finished 在流
+       中途失败时，finally 的 ac.abort() 会摧毁仍在传输中、且从未被消费的
+       POST /prompt 响应体（opencode 侧同秒记 499 client-dropped），这个 AbortError
+       没有任何接收者，升级为 uncaughtException，宿主 fatal 兜底杀掉整个 DSH 主进程。
+       热服务下流自然收尾、abort 时响应体已闭合，所以平时无雷——这就是「只在
+       冷启动首条消息炸」的真相（16:19:25 / 16:39:28 / 17:37:47 三次同签名）。
+       修法：abort 前先显式 cancel 把响应体标记为已消费（undici 对已取消的 body
+       不再外抛 error），abort 本身再包一层兜底——两道闸后这条路产不出无人接住的
+       异常，插件层异常不再连累宿主进程。 */
+    try { await res?.body?.cancel(); } catch { /* 响应体销毁失败不追责 */ }
+    try { ac.abort(); } catch { /* 保险丝 */ }
     signal?.removeEventListener('abort', onOuter);
   }
 }
