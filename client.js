@@ -424,6 +424,9 @@ window.__ModuleLoader__.load({
         'logs.page': '第 {page} 页 / 共 {pages} 页',
         'logs.windowNote': '逐条日志保留最近窗口；历史只保留按日聚合（约 90 天），数据看板的「全部历史」即来源于此。',
         'gw.title': '网关设置',
+        'bridge.missingTitle': '本机未安装 opencode CLI——免费模型（OFM 车道）不可用。',
+        'bridge.missingHint': '这是本插件唯一的外部前置。安装：npm i -g @opencode/cli（或 opencode.ai 下载安装包），装完重启 DSH 即可，无需配置 API Key。',
+        'bridge.ready': '本机 opencode 已就绪，免费车道可按需自动拉起服务。',
         'gw.sub': '把渠道模型以 OpenAI 兼容接口发给本机与局域网工具：端点、密钥与转发端口都在这里。',
         'gw.gatewayTitle': '渠道模型网关（OpenAI 兼容）',
         'gw.gatewayHint': '覆盖全部已接入渠道；Chat Completions 与 Responses 两套接口同时可用。',
@@ -1040,6 +1043,9 @@ window.__ModuleLoader__.load({
         'logs.page': 'Page {page} of {pages}',
         'logs.windowNote': 'Per-request rows cover a recent window only; history is kept as daily aggregates (~90 days) — the dashboard\'s "All time" reads those.',
         'gw.title': 'Gateway settings',
+        'bridge.missingTitle': 'opencode CLI not found on this machine — the free-model lane is unavailable.',
+        'bridge.missingHint': 'The only external prerequisite of this plugin. Install with: npm i -g @opencode/cli (or grab an installer from opencode.ai), then restart DSH. No API key needed.',
+        'bridge.ready': 'Local opencode is ready; the free lane will start its service on demand.',
         'gw.sub': 'Serve the channel models over an OpenAI-compatible API to this machine and the LAN: endpoint, key and relay port live here.',
         'gw.gatewayTitle': 'Channel gateway (OpenAI compatible)',
         'gw.gatewayHint': 'Covers every connected channel; Chat Completions and Responses are both served.',
@@ -4613,6 +4619,17 @@ window.__ModuleLoader__.load({
         if (!available) return
         try { setStatus(await rpc('gateway.getEnabled', {}, 30_000)) } catch (error) { setNotice(String(error?.message ?? error)) }
       }, [available, rpc])
+      // 本机 opencode 前置状态（2026-11-11）：免费车道靠本机 opencode 服务代发，
+      // CLI 没装时模型列表再漂亮也一条都跑不通——把这件事摆到台面上。
+      // 拉不到（旧后端无此端点）就存 null，整块不渲染，不制造假警报。
+      const [bridgeStatus, setBridgeStatus] = useState(null)
+      useEffect(() => {
+        let alive = true
+        api('/bridge/status', { timeout: 15_000 })
+          .then(data => { if (alive) setBridgeStatus(data) })
+          .catch(() => { if (alive) setBridgeStatus(null) })
+        return () => { alive = false }
+      }, [])
       const loadRelay = useCallback(async () => {
         try { setRelay(await api('/chan-gateway')) } catch { setRelay(null) }
       }, [])
@@ -4645,6 +4662,15 @@ window.__ModuleLoader__.load({
         h(PageHero, { title: t('gw.title'), sub: t('gw.sub') },
           h(Button, { onClick: () => { void loadGateway(); void loadRelay() } }, t('dash.refresh'))),
         notice !== '' ? h('div', { className: 'ofm_callout ofm_error' }, h('div', null, notice)) : null,
+        bridgeStatus !== null && bridgeStatus.cli === false
+          ? h('div', { className: 'ofm_callout ofm_error' },
+              h('div', null,
+                h('div', null, t('bridge.missingTitle')),
+                h('div', { className: 'ofm_note' }, t('bridge.missingHint'))))
+          : null,
+        bridgeStatus !== null && bridgeStatus.cli === true
+          ? h('div', { className: 'ofm_callout' }, h('div', { className: 'ofm_note' }, t('bridge.ready')))
+          : null,
         h(Section, { title: t('gw.gatewayTitle'), hint: t('gw.gatewayHint') },
           status === undefined ? h('div', { className: 'ofm_skel', style: { minHeight: 96 } })
             : h('div', { className: 'ofm_panel' },

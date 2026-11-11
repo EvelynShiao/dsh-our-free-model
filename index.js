@@ -31,7 +31,7 @@ import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { ROUTE_LABELS, ROUTE_MAIN, ROUTE_REGION } from './src/adapter.js'
 import { DATA_DIR_NAME, decodeWindow, resolveDshHome } from './src/store.js'
-import { configureBridge, ensureService } from './src/opencode-bridge.js'
+import { configureBridge, ensureService, readService, hasOpencodeCli } from './src/opencode-bridge.js'
 import { isEacEntry, isKiloEntry } from './src/catalog.js'
 import { STATE } from './src/probe.js'
 import { generateKey, rankLanAddresses, startForwardServer, startLanRelay } from './src/forward.js'
@@ -1902,6 +1902,11 @@ function createApiRoutes(deps) {
       }
       if (method === 'GET' && routePath === '/eac/status') {
         return send(200, await deps.eacAuth.status())
+      }
+      if (method === 'GET' && routePath === '/bridge/status') {
+        // 本机 opencode 前置状态（2026-11-11，用户点名「下了插件还要单独去弄附加的东西」要可视化）：
+        // cli=false 时前端给出安装指引；service 有值 = service.json/环境变量已配好。
+        return send(200, { cli: hasOpencodeCli(), service: readService()?.url ?? null })
       }
       if (method === 'POST' && routePath === '/eac/logout') {
         return send(200, await deps.eacAuth.logout())
