@@ -491,16 +491,62 @@ export function apply(ctx, config) {
 
   // ── registration ────────────────────────────────────────────────────────────
   const routes = () => Object.keys(state().membership)
-  const registration = ctx.llm.registerAdapter([ROUTE_MAIN, ROUTE_REGION], adapter)
-  ctx.llm.registerConfigurableProviders?.([
-    { provider: ROUTE_MAIN, displayName: ROUTE_LABELS[ROUTE_MAIN], settingsNs: ctx.fiber?.entry?.options?.id ?? name, settingsPath: [] },
-  ])
+  /* 热重载竞态自愈（2026-11-11）：cordis restart() 新旧两代并发，本插件 apply 可能
+     跑在 llm 服务"旧代已停、新代未挂"的窗口里——registerAdapter /
+     registerConfigurableProviders / registerModelDiscovery 都会在 inactive context
+     上抛 "cannot create effect on inactive context"。registerAdapter 改为有界重试：
+     每 500ms 重读 ctx.llm（拿到新代服务对象后再注册），最长 60s；其余错误原样抛出。
+     另两个是可选通告，失败降级为 warn，不阻断启动。 */
+  function registerAdapterResilient(providers, adapterFn, label) {
+    let handle = null
+    let cancelled = false
+    let pendingReplace = null
+    let attempts = 0
+    let timer = null
+    const schedule = () => {
+      if (cancelled) return
+      if (++attempts > 120) { logger.warn?.(`our-free-model: ${label} 重试放弃（llm 服务 60s 内不可用）`); return }
+      timer = setTimeout(() => { timer = null; try { attempt() } catch (error) { logger.warn?.(`our-free-model: ${label} 重试失败`, error) } }, 500)
+      timer.unref?.()
+    }
+    const attempt = () => {
+      if (cancelled) return
+      const llm = ctx.llm
+      if (!llm || typeof llm.registerAdapter !== 'function') { schedule(); return }
+      try {
+        handle = llm.registerAdapter(providers, adapterFn)
+        if (pendingReplace) { try { handle.replace(pendingReplace) } catch {} pendingReplace = null }
+      } catch (error) {
+        if (/inactive context|INACTIVE_EFFECT/i.test(String(error?.message ?? error))) { schedule(); return }
+        throw error
+      }
+    }
+    attempt()
+    const disposer = () => {
+      cancelled = true
+      if (timer) { clearTimeout(timer); timer = null }
+      try { handle?.() } catch {}
+    }
+    disposer.replace = (next) => {
+      if (handle) handle.replace(next)
+      else pendingReplace = next
+    }
+    return disposer
+  }
+  const registration = registerAdapterResilient([ROUTE_MAIN, ROUTE_REGION], adapter, 'registerAdapter')
+  try {
+    ctx.llm.registerConfigurableProviders?.([
+      { provider: ROUTE_MAIN, displayName: ROUTE_LABELS[ROUTE_MAIN], settingsNs: ctx.fiber?.entry?.options?.id ?? name, settingsPath: [] },
+    ])
+  } catch (error) {
+    logger.warn?.(`our-free-model: registerConfigurableProviders 失败（不阻断启动）: ${String(error?.message ?? error)}`)
+  }
 
   // Advertise a probe endpoint for the in-app "detect models" button. It offers
   // what the picker itself advertises — a model the gateway refuses to route at
   // all must not be addable to a profile just because it still appears in the
   // upstream listing.
-  ctx.llm.registerModelDiscovery?.(ctx.fiber?.entry?.options?.id ?? name, async () => {
+  try { ctx.llm.registerModelDiscovery?.(ctx.fiber?.entry?.options?.id ?? name, async () => {
     // 探测间隔=0（2026-11-04 用户定案）→ 宿主发现模型也不触发探针轮（探针是
     // 真实请求，会烧 opencode 免费额度），只刷名单。
     await refreshCatalog({ probe: Number(settings.get().probeIntervalMinutes) > 0, force: true })
@@ -514,7 +560,9 @@ export function apply(ctx, config) {
         maxTokens: entry.maxOutput,
         inputModalities: entry.vision ? ['text', 'image'] : ['text'],
       }))
-  })
+  }) } catch (error) {
+    logger.warn?.(`our-free-model: registerModelDiscovery 失败（不阻断启动）: ${String(error?.message ?? error)}`)
+  }
 
   ctx.on?.('loader/volatile-update', () => {
     registration.replace(routes())
