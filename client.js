@@ -425,8 +425,12 @@ window.__ModuleLoader__.load({
         'logs.windowNote': '逐条日志保留最近窗口；历史只保留按日聚合（约 90 天），数据看板的「全部历史」即来源于此。',
         'gw.title': '网关设置',
         'bridge.missingTitle': '本机未安装 opencode CLI——免费模型（OFM 车道）不可用。',
-        'bridge.missingHint': '这是本插件唯一的外部前置。安装：npm i -g @opencode/cli（或 opencode.ai 下载安装包），装完重启 DSH 即可，无需配置 API Key。',
+        'bridge.missingHint': '这是本插件唯一的外部前置。点下方按钮自动安装（默认走 npmmirror 镜像，可用 NPM_REGISTRY 环境变量换源）；也可从 opencode.ai 下载安装包。装完即刻生效，无需重启 DSH，无需配置 API Key。',
         'bridge.ready': '本机 opencode 已就绪，免费车道可按需自动拉起服务。',
+        'bridge.installBtn': '一键安装 opencode CLI',
+        'bridge.installRunning': '安装中，请稍候…',
+        'bridge.installDone': '安装完成，免费车道已可用。',
+        'bridge.installFailed': '安装未成功，看下方日志。',
         'gw.sub': '把渠道模型以 OpenAI 兼容接口发给本机与局域网工具：端点、密钥与转发端口都在这里。',
         'gw.gatewayTitle': '渠道模型网关（OpenAI 兼容）',
         'gw.gatewayHint': '覆盖全部已接入渠道；Chat Completions 与 Responses 两套接口同时可用。',
@@ -1044,8 +1048,12 @@ window.__ModuleLoader__.load({
         'logs.windowNote': 'Per-request rows cover a recent window only; history is kept as daily aggregates (~90 days) — the dashboard\'s "All time" reads those.',
         'gw.title': 'Gateway settings',
         'bridge.missingTitle': 'opencode CLI not found on this machine — the free-model lane is unavailable.',
-        'bridge.missingHint': 'The only external prerequisite of this plugin. Install with: npm i -g @opencode/cli (or grab an installer from opencode.ai), then restart DSH. No API key needed.',
+        'bridge.missingHint': "The only external prerequisite of this plugin. Hit the button below to install automatically (npmmirror registry by default; set the NPM_REGISTRY env var to switch), or grab an installer from opencode.ai. Takes effect immediately — no DSH restart, no API key needed.",
         'bridge.ready': 'Local opencode is ready; the free lane will start its service on demand.',
+        'bridge.installBtn': 'Install opencode CLI',
+        'bridge.installRunning': 'Installing, please wait…',
+        'bridge.installDone': 'Installed — the free lane is ready.',
+        'bridge.installFailed': 'Install failed — see the log below.',
         'gw.sub': 'Serve the channel models over an OpenAI-compatible API to this machine and the LAN: endpoint, key and relay port live here.',
         'gw.gatewayTitle': 'Channel gateway (OpenAI compatible)',
         'gw.gatewayHint': 'Covers every connected channel; Chat Completions and Responses are both served.',
@@ -4630,6 +4638,29 @@ window.__ModuleLoader__.load({
           .catch(() => { if (alive) setBridgeStatus(null) })
         return () => { alive = false }
       }, [])
+      // 一键安装 opencode CLI（2026-11-11）：POST 触发后端异步 npm i -g，
+      // 这里 2s 轮询 /bridge/status 拿 install 进度与日志；running 归零即停，
+      // 同时刷新 bridgeStatus——cli 翻 true 后红条自动换成 ready 绿条。
+      const [cliInstall, setCliInstall] = useState(null)
+      const startCliInstall = () => {
+        if (cliInstall?.running === true) return
+        setCliInstall({ running: true, ok: null, log: '提交安装请求…\n' })
+        post('/bridge/install-cli', {})
+          .then(data => { setCliInstall(data.install ?? null) })
+          .catch(error => { setCliInstall({ running: false, ok: false, log: `[fetch] ${String(error?.message ?? error)}` }) })
+      }
+      useEffect(() => {
+        if (cliInstall?.running !== true) return
+        const timer = setInterval(() => {
+          api('/bridge/status', { timeout: 10_000 })
+            .then(data => {
+              setBridgeStatus({ cli: data.cli, service: data.service })
+              setCliInstall(data.install ?? null)
+            })
+            .catch(() => { /* 网络抖动：下一轮再试 */ })
+        }, 2000)
+        return () => clearInterval(timer)
+      }, [cliInstall?.running])
       const loadRelay = useCallback(async () => {
         try { setRelay(await api('/chan-gateway')) } catch { setRelay(null) }
       }, [])
@@ -4666,7 +4697,25 @@ window.__ModuleLoader__.load({
           ? h('div', { className: 'ofm_callout ofm_error' },
               h('div', null,
                 h('div', null, t('bridge.missingTitle')),
-                h('div', { className: 'ofm_note' }, t('bridge.missingHint'))))
+                h('div', { className: 'ofm_note' }, t('bridge.missingHint')),
+                h('div', { style: { marginTop: 8 } },
+                  h(Button, {
+                    onClick: startCliInstall,
+                    disabled: cliInstall?.running === true,
+                  }, cliInstall?.running === true ? t('bridge.installRunning') : t('bridge.installBtn'))),
+              cliInstall !== null
+                ? h('div', { style: { marginTop: 8 } },
+                    cliInstall.ok === true ? h('div', { className: 'ofm_note' }, t('bridge.installDone'))
+                      : cliInstall.ok === false ? h('div', { className: 'ofm_note' }, t('bridge.installFailed'))
+                      : cliInstall.running === true ? h('div', { className: 'ofm_note' }, t('bridge.installRunning'))
+                      : null,
+                    typeof cliInstall.log === 'string' && cliInstall.log !== ''
+                      ? h('pre', {
+                          className: 'ofm_mono',
+                          style: { margin: '6px 0 0', maxHeight: 180, overflow: 'auto', whiteSpace: 'pre-wrap', fontSize: 12 },
+                        }, cliInstall.log)
+                      : null)
+                : null))
           : null,
         bridgeStatus !== null && bridgeStatus.cli === true
           ? h('div', { className: 'ofm_callout' }, h('div', { className: 'ofm_note' }, t('bridge.ready')))

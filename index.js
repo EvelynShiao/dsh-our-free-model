@@ -103,6 +103,49 @@ function openExternal(url) {
   }
 }
 
+/* ── opencode CLI 一键安装（2026-11-11，用户点名「都要升级成按钮」）──────────────
+ * 与知识库 vecInstall 同款模式：异步 spawn + 模块级状态对象 + 前端 2s 轮询
+ * /bridge/status 拿进度（安装要下包，同步等待必撞 fetch 超时）。
+ * registry 不硬编码：process.env.NPM_REGISTRY || npmmirror——与知识库
+ * install-vec-runtime 脚本同规则。Windows 上 npm 是 npm.cmd，Node ≥20.12 无
+ * shell 直接 spawn .cmd 报 EINVAL，所以统一 shell:true（命令行只含固定包名与
+ * registry 常量，无用户输入，无注入面）。装完 close 回调用 hasOpencodeCli()
+ * 复核（npm 退出码 0 但装到自定义 prefix 时仍算失败，日志给出原因）；
+ * CLI 检测无缓存，装完无需重启 DSH，ensureService 按需拉起。 */
+const cliInstall = { running: false, startedAt: 0, finishedAt: 0, ok: null, log: '' }
+
+function startCliInstall() {
+  if (cliInstall.running) return false
+  const registry = process.env.NPM_REGISTRY || 'https://registry.npmmirror.com'
+  cliInstall.running = true
+  cliInstall.startedAt = Date.now()
+  cliInstall.finishedAt = 0
+  cliInstall.ok = null
+  cliInstall.log = `$ npm i -g @opencode/cli --registry ${registry}\n`
+  const child = spawn('npm', ['i', '-g', '@opencode/cli', '--registry', registry],
+    { shell: true, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
+  const append = data => { cliInstall.log = (cliInstall.log + String(data)).slice(-16000) }
+  child.stdout?.on('data', append)
+  child.stderr?.on('data', append)
+  child.on('error', error => {
+    cliInstall.log += `\n[spawn] ${String(error?.message ?? error)}`
+    cliInstall.running = false
+    cliInstall.ok = false
+    cliInstall.finishedAt = Date.now()
+  })
+  child.on('close', code => {
+    cliInstall.running = false
+    cliInstall.ok = code === 0 && hasOpencodeCli()
+    cliInstall.finishedAt = Date.now()
+    cliInstall.log += `\n[exit ${code}]` + (cliInstall.ok
+      ? ' 安装完成——CLI 检测已通过，无需重启 DSH，免费车道即刻可用。'
+      : code === 0
+        ? ' npm 退出码 0，但 PATH/npm 全局候选路径里没找到 opencode 可执行文件（可能装到了自定义 prefix）——把该 prefix 加入 PATH 或手动检查。'
+        : ' 安装失败（看上方日志；常见原因：网络/代理不通，可自设 NPM_REGISTRY 环境变量换源后重试）。')
+  })
+  return true
+}
+
 /**
  * `llm` is what the plugin exists for, so it is the only hard requirement of the
  * plugin itself.
@@ -1906,7 +1949,14 @@ function createApiRoutes(deps) {
       if (method === 'GET' && routePath === '/bridge/status') {
         // 本机 opencode 前置状态（2026-11-11，用户点名「下了插件还要单独去弄附加的东西」要可视化）：
         // cli=false 时前端给出安装指引；service 有值 = service.json/环境变量已配好。
-        return send(200, { cli: hasOpencodeCli(), service: readService()?.url ?? null })
+        // install = 一键安装状态（2026-11-11 按钮升级）：前端 2s 轮询本端点拿进度与日志。
+        return send(200, { cli: hasOpencodeCli(), service: readService()?.url ?? null, install: { ...cliInstall } })
+      }
+      if (method === 'POST' && routePath === '/bridge/install-cli') {
+        // 一键安装 opencode CLI（npm i -g，registry 走 NPM_REGISTRY 环境变量）。
+        // 已在跑时不 409：回当前状态，前端拿到的仍是可渲染的最新进度。
+        const started = startCliInstall()
+        return send(200, { ok: true, started, install: { ...cliInstall } })
       }
       if (method === 'POST' && routePath === '/eac/logout') {
         return send(200, await deps.eacAuth.logout())
