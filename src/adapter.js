@@ -1227,7 +1227,6 @@ function renderBridgePrompt(messages, entry, tools) {
   if (protocol !== '') {
     const line = `System: ${protocol}`
     parts.push(line)
-    total += line.length
   }
   const msgList = Array.isArray(messages) ? messages : []
   const reversed = msgList.slice().reverse()
