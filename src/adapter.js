@@ -1216,8 +1216,8 @@ function parseBridgeToolCalls(segments) {
  */
 function renderBridgePrompt(messages, entry, tools) {
   const parts = []
-  const LIMIT = 400000
-  let total = 0
+  /* 2026-11-14 取消 400k 限制：用户确认不是超限问题，是报错问题。
+     不再截断任何消息，完整保留所有历史。 */
   /* 2026-11-08 网关滥用检测修复（配合 opencode-bridge.js mute2 放开工具限制）：
      build agent 走系统默认 prompt，其系统指令在 system 位置；我们的协议若追在 user 尾巴
      会被模型判定为「提示词注入」拒绝照做（10-31 实锤）。现把协议前置为开头的
@@ -1229,7 +1229,10 @@ function renderBridgePrompt(messages, entry, tools) {
     parts.push(line)
     total += line.length
   }
-  for (const message of Array.isArray(messages) ? messages : []) {
+  const msgList = Array.isArray(messages) ? messages : []
+  const reversed = msgList.slice().reverse()
+  const collected = []
+  for (const message of reversed) {
     const role = message?.role ?? 'user'
     const label = role === 'assistant' ? 'Assistant' : role === 'system' ? 'System' : role === 'tool' ? 'Tool' : 'User'
     const body = (Array.isArray(message?.content) ? message.content : []).map((block) => {
@@ -1242,10 +1245,9 @@ function renderBridgePrompt(messages, entry, tools) {
     }).filter((line) => line !== '').join('\n')
     if (body === '') continue
     const line = `${label}: ${body}`
-    total += line.length
-    if (total > LIMIT) break
-    parts.push(line)
+    collected.unshift(line)
   }
+  parts.push(...collected)
   return parts.join('\n\n')
 }
 
