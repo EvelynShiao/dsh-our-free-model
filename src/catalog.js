@@ -142,12 +142,33 @@ export const EAC_CHANNEL = 'eac'
 export const EAC_TAG = 'EAC'
 
 const EAC_DISPLAY_NAMES = {
+  // These two ids are the lane's routing names; the models behind them are
+  // Dahl Inference's (`inference.dahl.global`), whose own docs name them
+  // "DeepSeek V4 Flash" and "GLM 5.3 Flash". The card shows that name, not the
+  // relay's internal spelling — the org prefix and the `-free` suffix are both
+  // routing detail.
+  'opencode/deepseek-v4.1-flash-free': 'DeepSeek V4 Flash',
+  'opencode/glm-5.3-flash-free': 'GLM 5.3 Flash',
   'deepseek-ai/deepseek-v4.1-flash': 'DeepSeek V4.1 Flash',
-  'moonshotai/kimi-k2.6': 'Kimi K2.6',
+  // Kimi K2.6 was removed from the NVIDIA channel on 2026-11-14 (its listing
+  // there never served this lane), so it is no longer named here either — an
+  // entry the catalog cannot receive is a name the picker never shows.
   'moonshotai/kimi-k3': 'Kimi K3',
   'openai/gpt-oss-20b': 'GPT-OSS 20B',
   'z-ai/glm-5.3': 'GLM 5.3',
   'z-ai/glm-5.3-flash': 'GLM 5.3 Flash',
+  'mistralai/mistral-large-4-1t-a52b': 'Mistral Large 4 1T A52B',
+  // AMD Radeon (developer.amd.com.cn). The lane namespaces its ids `amd/…`;
+  // the card drops the prefix the same way it drops `org/` elsewhere.
+  'amd/DeepSeek-V4.1-Flash': 'DeepSeek V4.1 Flash (AMD)',
+  'amd/DeepSeek-V4-Flash': 'DeepSeek V4 Flash (AMD)',
+  'amd/Gemma-4-31B-IT': 'Gemma 4 31B IT (AMD)',
+  'amd/GLM-5.3-Flash': 'GLM 5.3 Flash (AMD)',
+  'amd/MiMo-V2.6-Flash': 'MiMo V2.6 Flash (AMD)',
+  'amd/MiniCPM5-2B': 'MiniCPM5 2B (AMD)',
+  'amd/MiniCPM-V-4.7-1B': 'MiniCPM-V 4.7 1B (AMD)',
+  'amd/MiniCPM-V-4.7-35B-A3B': 'MiniCPM-V 4.7 35B A3B (AMD)',
+  'amd/Qwen3.8-27B': 'Qwen3.8 27B (AMD)',
 }
 
 /**
@@ -171,12 +192,158 @@ const EAC_DISPLAY_NAMES = {
  * fall back to the family-standard `reasoning_effort` field.
  */
 const EAC_CAPABILITIES = [
+  // NVIDIA Build — the ids the co-paid lane relays from integrate.api.nvidia.com.
+  {
+    match: /^mistralai\/mistral-large-4-1t-a52b/,
+    vision: true, reasoning: true, contextWindow: 262144, maxOutput: 32768,
+    efforts: ['disabled', 'high'], effortDefault: 'high',
+    effortPatch: { reasoning_effort: '$effort' },
+    effortOffPatch: { reasoning_effort: 'none' },
+  },
+  {
+    match: /^deepseek-ai\/deepseek-v4\.1-flash/,
+    vision: true, reasoning: true, contextWindow: 1048576, maxOutput: 32768,
+    efforts: ['disabled', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'], effortDefault: 'high',
+    effortPatch: { reasoning_effort: '$effort' },
+    effortOffPatch: { reasoning_effort: 'none' },
+  },
+  {
+    match: /^z-ai\/glm-5\.3-flash/,
+    vision: true, reasoning: true, contextWindow: 1048576, maxOutput: 32768,
+    efforts: ['disabled', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'], effortDefault: 'high',
+    effortPatch: { reasoning_effort: '$effort' },
+    effortOffPatch: { reasoning_effort: 'none' },
+  },
+  // The OpenCode lane's two ids, served by Dahl Inference
+  // (`inference.dahl.global`, docs read 2026-11-14). Both are the broker's own
+  // ids: DeepSeek-V4-Flash-0731 and GLM-5.3-Flash.
+  //
+  // - Window: Dahl's `/docs/models/` publishes 400K for both.
+  // - Vision: Dahl states plainly that vision "is not offered on current
+  //   models", and `image_url` content is rejected with a 400 — so `vision` is
+  //   false, not the NVIDIA Build `true` its namesakes carry.
+  // - Menu: Dahl validates `reasoning_effort` against
+  //   none|minimal|low|medium|high|xhigh|max and rejects `disabled` by name
+  //   ("unsupported value: got \"disabled\""), so the off rung is `none` — the
+  //   `effortOffPatch` below, which is what the plugin sends for `disabled`.
+  // - Output: DeepSeek's ceiling is measured, not guessed — a 5M `max_tokens`
+  //   request came back `finish_reason: length` at 8192 completion tokens, so
+  //   the broker caps output there regardless of what the caller asks for. GLM
+  //   shares that broker cap; Dahl publishes no per-model figure.
+  {
+    match: /^opencode\/deepseek-v4/,
+    vision: false, reasoning: true, contextWindow: 409600, maxOutput: 8192,
+    efforts: ['disabled', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'], effortDefault: 'high',
+    effortPatch: { reasoning_effort: '$effort' },
+    effortOffPatch: { reasoning_effort: 'none' },
+  },
+  {
+    // GLM answers with reasoning even at `none` (measured: `none` still spent
+    // 57 reasoning tokens), so its menu has no off rung and the card shows the
+    // shared-budget tag rather than promising a switch it cannot honour.
+    match: /^opencode\/glm-5\.3-flash/,
+    vision: false, reasoning: true, contextWindow: 409600, maxOutput: 8192,
+    efforts: ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'], effortDefault: 'high',
+    effortPatch: { reasoning_effort: '$effort' },
+  },
+  // ── AMD Radeon (developer.amd.com.cn) ───────────────────────────────────────
+  //
+  // Two sources, each used for what it actually publishes:
+  //
+  // - The platform's own listing (`GET /radeon/api/v1/models`, read 2026-11-14)
+  //   carries `context_length`, `architecture.input_modalities`, and a
+  //   per-provider block with `vision`, `reasoning` and `tools`.
+  //   `supported_parameters` lists `reasoning_effort`, so the level is the real
+  //   control on the wire.
+  // - The output ceiling comes from **each model's own vendor docs**, because
+  //   the platform publishes none. Where a vendor publishes one it is used
+  //   verbatim; where a vendor publishes none either, `maxOutput` falls back to
+  //   the platform's window and the comment says so — a guess is worse than a
+  //   generous ceiling the vendor may clamp.
+  //
+  // Per-model vendor sources:
+  // - DeepSeek V4.1 Flash / V4 Flash: api-docs.deepseek.com model table —
+  //   1M context, 384K max output (`deepseek-flash`, "DeepSeek-V4.1-Flash-1017";
+  //   the older v4-flash name is served by the same model).
+  // - GLM-5.3-Flash: docs.z.ai/guides/llm/glm-5.3-flash — 1M context, 128K max
+  //   output. (The platform's listing reports 262144 for this id; the vendor's
+  //   own figure is the larger one, so the window below is the platform's, which
+  //   is the one requests actually hit.)
+  // - Gemma 4 31B IT: ai.google.dev model card — 256K context; Google publishes
+  //   no output ceiling, so it inherits the window.
+  // - MiMo V2.6 Flash / Qwen3.8 27B / MiniCPM-V 4.7 / MiniCPM5 2B: neither the
+  //   platform nor the vendor publishes an output ceiling (checked 2026-11-14),
+  //   so each inherits its window and the card shows the window as the ceiling.
+  {
+    match: /^amd\/DeepSeek-V4\.1-Flash/,
+    vision: true, reasoning: true, contextWindow: 1048576, maxOutput: 393216,
+    efforts: ['disabled', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'], effortDefault: 'high',
+    effortPatch: { reasoning_effort: '$effort' },
+    effortOffPatch: { reasoning_effort: 'none' },
+  },
+  {
+    match: /^amd\/DeepSeek-V4-Flash/,
+    vision: false, reasoning: true, contextWindow: 1048576, maxOutput: 393216,
+    efforts: ['disabled', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'], effortDefault: 'high',
+    effortPatch: { reasoning_effort: '$effort' },
+    effortOffPatch: { reasoning_effort: 'none' },
+  },
+  {
+    match: /^amd\/GLM-5\.3-Flash/,
+    vision: false, reasoning: true, contextWindow: 262144, maxOutput: 131072,
+    efforts: ['disabled', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'], effortDefault: 'high',
+    effortPatch: { reasoning_effort: '$effort' },
+    effortOffPatch: { reasoning_effort: 'none' },
+  },
+  {
+    // Xiaomi publishes no output ceiling for MiMo V2.6 Flash, so it inherits
+    // the window rather than a guessed 32K.
+    match: /^amd\/MiMo-V2\.6-Flash/,
+    vision: true, reasoning: true, contextWindow: 1048576, maxOutput: 1048576,
+    efforts: ['disabled', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'], effortDefault: 'high',
+    effortPatch: { reasoning_effort: '$effort' },
+    effortOffPatch: { reasoning_effort: 'none' },
+  },
+  {
+    // Google's Gemma 4 model card states 256K of context and no output ceiling.
+    match: /^amd\/Gemma-4-31B-IT/,
+    vision: true, reasoning: true, contextWindow: 262144, maxOutput: 262144,
+    efforts: ['disabled', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'], effortDefault: 'high',
+    effortPatch: { reasoning_effort: '$effort' },
+    effortOffPatch: { reasoning_effort: 'none' },
+  },
+  {
+    // Alibaba publishes no output ceiling for Qwen3.8-27B on the model-studio
+    // pages; it inherits the window.
+    match: /^amd\/Qwen3\.8-27B/,
+    vision: true, reasoning: true, contextWindow: 262144, maxOutput: 262144,
+    efforts: ['disabled', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'], effortDefault: 'high',
+    effortPatch: { reasoning_effort: '$effort' },
+    effortOffPatch: { reasoning_effort: 'none' },
+  },
+  {
+    // OpenBMB publishes no output ceiling for the MiniCPM-V 4.7 pair either.
+    match: /^amd\/MiniCPM-V/,
+    vision: true, reasoning: true, contextWindow: 262144, maxOutput: 262144,
+    efforts: ['disabled', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'], effortDefault: 'high',
+    effortPatch: { reasoning_effort: '$effort' },
+    effortOffPatch: { reasoning_effort: 'none' },
+  },
+  {
+    // MiniCPM5-2B: the project README states "Context Length 131,072" and no
+    // output ceiling.
+    match: /^amd\/MiniCPM5-2B/,
+    vision: false, reasoning: true, contextWindow: 131072, maxOutput: 131072,
+    efforts: ['disabled', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'], effortDefault: 'high',
+    effortPatch: { reasoning_effort: '$effort' },
+    effortOffPatch: { reasoning_effort: 'none' },
+  },
   {
     match: /^deepseek-ai\/deepseek-v4/,
-    vision: true, reasoning: true, contextWindow: 1048576, maxOutput: 384000,
-    efforts: ['disabled', 'low', 'high', 'max'], effortDefault: 'high',
+    vision: true, reasoning: true, contextWindow: 1048576, maxOutput: 32768,
+    efforts: ['disabled', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'], effortDefault: 'high',
     effortPatch: { reasoning_effort: '$effort' },
-    effortOffPatch: { reasoning: { enabled: false } },
+    effortOffPatch: { reasoning_effort: 'none' },
   },
   {
     match: /^moonshotai\/kimi-k3/,
@@ -189,12 +356,6 @@ const EAC_CAPABILITIES = [
     vision: true, reasoning: true, contextWindow: 262144, maxOutput: 98304,
     efforts: ['low', 'high', 'max'], effortDefault: 'high',
     effortPatch: { reasoning_effort: '$effort' },
-  },
-  {
-    match: /^z-ai\/glm-5\.3-flash/,
-    vision: true, reasoning: true, contextWindow: 1048576, maxOutput: 131072,
-    efforts: ['low', 'high', 'max'], effortDefault: 'high',
-    effortPatch: { thinking: { type: 'enabled' }, output_config: { effort: '$effort' } },
   },
   {
     match: /^z-ai\/glm-5/,
