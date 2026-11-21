@@ -1800,7 +1800,8 @@ function sanitizeSettings(patch, current) {
     const value = Number(next.probeIntervalMinutes)
     next.probeIntervalMinutes = Number.isFinite(value) && value >= 0
       ? Math.trunc(value)
-      : (Number(current.probeIntervalMinutes) || 15)
+      /* 2026-11-20 深夜：兜底 15→0（fork 语义=探针默认停，防兜底复燃烧额度）。 */
+      : (Number(current.probeIntervalMinutes) || 0)
   }
   positive('feedPollMinutes', 30)
   // 0 是有效答案：跟随模型自身输出上限（2026-10-15）。与 updateCheckHours 同理，
@@ -2492,7 +2493,8 @@ function publicSettings(settings, forwardInfo, egressInfo) {
   return {
     enabled: settings.enabled !== false,
     exposeRegionModels: settings.exposeRegionModels !== false,
-    probeIntervalMinutes: settings.probeIntervalMinutes ?? 15,
+    /* 2026-11-20 深夜：回显兜底 15→0（fork 语义=探针默认停）。 */
+    probeIntervalMinutes: settings.probeIntervalMinutes ?? 0,
     /* 2026-10-23 修「隐藏改不了」：publicSettings 此前不回传 hiddenModels，
        Roster 读到的 summary.settings.hiddenModels 永远 undefined，
        眼睛按钮点击后 UI 状态永不变（后端 listModels 过滤其实活着）。

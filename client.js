@@ -2829,7 +2829,8 @@ window.__ModuleLoader__.load({
          2026-11-04（用户定案「探测间隔=0 就是不探测」）：间隔填 0 停跑全部自动
          探针（启动轮/宿主发现轮/周期轮全停）——探针是真实请求，烧穿 opencode
          免费层 ~200 次/天，真实聊天反而永远 503；手动「立即探测」不受影响。 */
-      const probeInterval = Number(summary.settings?.probeIntervalMinutes ?? 15)
+      /* 2026-11-20 深夜（用户令「你自己弄」）：summary 失败兜底 15→0——fork 语义=探针默认停（11-04 定案「间隔=0 就是不探测」），兜底给 15 会在 summary 异常时把 15 写回 settings 复燃探针烧额度。 */
+      const probeInterval = Number(summary.settings?.probeIntervalMinutes ?? 0)
       const probeSkip = summary.settings?.probeSkipFreeLane === true
       const [probeIntervalDraft, setProbeIntervalDraft] = useState(probeInterval)
       const [probeBusy, setProbeBusy] = useState(false)
@@ -3506,7 +3507,7 @@ window.__ModuleLoader__.load({
           h(Switch, { checked: settings.enabled !== false, label: t('pref.enabled'), onChange: () => onApply({ enabled: !(settings.enabled !== false) }) }),
           h(Switch, { checked: settings.exposeRegionModels !== false, label: t('pref.exposeRegion'), onChange: () => onApply({ exposeRegionModels: !(settings.exposeRegionModels !== false) }) })),
         h('div', { className: 'ofm_row' },
-          field(t('pref.interval'), h('input', { className: 'ofm_input', style: { maxWidth: 100 }, value: draft?.probeIntervalMinutes ?? 15, onChange: e => setDraft(c => ({ ...c, probeIntervalMinutes: Number(e.target.value.replace(/\D/g, '')) || 0 })) })),
+          field(t('pref.interval'), h('input', { className: 'ofm_input', style: { maxWidth: 100 }, value: draft?.probeIntervalMinutes ?? 0, onChange: e => setDraft(c => ({ ...c, probeIntervalMinutes: Number(e.target.value.replace(/\D/g, '')) || 0 })) })),
           field(t('pref.maxTokens'), h('input', { className: 'ofm_input', style: { maxWidth: 120 }, value: draft?.defaultMaxTokens ?? 0, onChange: e => setDraft(c => ({ ...c, defaultMaxTokens: Number(e.target.value.replace(/\D/g, '')) || 0 })) })),
           h(Button, { kind: 'primary', disabled: busy, onClick: () => onApply({ probeIntervalMinutes: draft.probeIntervalMinutes, defaultMaxTokens: draft.defaultMaxTokens }) }, t('forward.apply'))),
         h('div', { className: 'ofm_row' },
